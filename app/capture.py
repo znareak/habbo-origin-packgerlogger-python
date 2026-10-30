@@ -55,9 +55,10 @@ class NpcapCaptureSource:
         self.queue: "queue.Queue[Packet]" = queue.Queue()
         self.info: dict = {}
         self._sniffer: Optional[AsyncSniffer] = None
-        # Modo de decodificacion Habbo (activado desde la interfaz)
-        self.habbo_decode = False
-        self._habbo_streams = {"Send": bytearray(), "Recv": bytearray()}
+        # Modo de decodificacion binaria (activado desde la interfaz)
+        self.binary_decode = False
+        self._binary_streams = {"Send": bytearray(), "Recv": bytearray()}
+        self._binary_framed = {"Send": False, "Recv": False}
 
     def resolve(self) -> dict:
         """Devuelve la conexion a capturar. Lanza RuntimeError si no existe."""
@@ -149,10 +150,30 @@ class NpcapCaptureSource:
             local_port = self.info.get("local_port")
             direction = "Send" if sport == local_port else "Recv"
 
-        if self.habbo_decode and self.info.get("proto", "tcp") == "tcp":
-            self._habbo_streams[direction].extend(payload)
-            for header, body in extract_habbo_frames(self._habbo_streams[direction]):
-                self._emit_packet(direction, format_habbo_message(direction, header, body))
+        if self.binary_decode and self.info.get("proto", "tcp") == "tcp":
+            stream = self._binary_streams[direction]
+            stream.extend(payload)
+            # Si esta direccion nunca produjo un mensaje con framing y la
+            # cabecera no parece una longitud valida, tratarla como flujo
+            # sin framing y mostrar el payload crudo en hex.
+            if len(stream) >= 4 and not self._binary_framed[direction]:
+                first_length = int.from_bytes(stream[0:4], "big")
+                if first_length < 2 or first_length > BINARY_MAX_MESSAGE_LENGTH:
+                    self._emit_packet(
+                        direction, _format_unframed_payload(bytes(stream))
+                    )
+                    stream.clear()
+                    return
+            # Extraer todos los mensajes con framing disponibles
+            while True:
+                frames = extract_binary_frames(stream)
+                if not frames:
+                    break
+                self._binary_framed[direction] = True
+                for header, body in frames:
+                    self._emit_packet(
+                        direction, format_binary_message(direction, header, body)
+                    )
             return
 
         self._emit_packet(direction, decode_payload(payload))
@@ -181,7 +202,8 @@ class NpcapCaptureSource:
             except Exception:
                 pass
             self._sniffer = None
-        self._habbo_streams = {"Send": bytearray(), "Recv": bytearray()}
+        self._binary_streams = {"Send": bytearray(), "Recv": bytearray()}
+        self._binary_framed = {"Send": False, "Recv": False}
 
     @property
     def running(self) -> bool:
@@ -199,19 +221,19 @@ class NpcapCaptureSource:
 
 
 # ---------------------------------------------------------------------------
-# Decodificador del protocolo binario de Habbo
+# Decodificador de protocolo binario con framing
 # ---------------------------------------------------------------------------
 #
-# El trafico de juego de Habbo (clientes 2015+) no va cifrado: cada mensaje es
+# Algunos protocolos de juegos online envian mensajes sin cifrar con la forma
 #   [longitud: int32 big-endian][header: int16 big-endian][cuerpo...]
 # donde la longitud incluye header (2 bytes) + cuerpo. Reensamblamos el flujo
 # TCP por direccion y decodificamos el cuerpo con una heuristica generica
 # (cadenas con prefijo de longitud, enteros, booleanos).
 
-HABBO_MAX_MESSAGE_LENGTH = 1 << 20  # 1 MB: si se supera, el flujo se desincronizo
+BINARY_MAX_MESSAGE_LENGTH = 1 << 20  # 1 MB: si se supera, el flujo se desincronizo
 
 
-def extract_habbo_frames(buffer: bytearray):
+def extract_binary_frames(buffer: bytearray):
     """Extrae mensajes completos de un buffer TCP y los consume.
 
     Devuelve una lista de (header, body). Los bytes incompletos quedan en el
@@ -223,7 +245,7 @@ def extract_habbo_frames(buffer: bytearray):
         if len(buffer) < 4:
             break
         length = int.from_bytes(buffer[0:4], "big")
-        if length < 2 or length > HABBO_MAX_MESSAGE_LENGTH:
+        if length < 2 or length > BINARY_MAX_MESSAGE_LENGTH:
             del buffer[0]
             continue
         if len(buffer) < 4 + length:
@@ -235,8 +257,8 @@ def extract_habbo_frames(buffer: bytearray):
     return frames
 
 
-def parse_habbo_tokens(body: bytes):
-    """Parsea el cuerpo de un mensaje Habbo con heuristica generica.
+def parse_binary_tokens(body: bytes):
+    """Parsea el cuerpo de un mensaje binario con heuristica generica.
 
     Devuelve una lista de (tipo, valor):
       ('s', str)   cadena con longitud int16 big-endian
@@ -278,17 +300,90 @@ def parse_habbo_tokens(body: bytes):
     return tokens
 
 
-def format_habbo_message(direction: str, header: int, body: bytes) -> str:
-    """Formatea un mensaje Habbo para mostrarlo en el logger."""
+def format_binary_message(direction: str, header: int, body: bytes) -> str:
+    """Formatea un mensaje binario para mostrarlo en el logger."""
     if body:
-        tokens = " ".join(_format_habbo_token(token) for token in parse_habbo_tokens(body))
+        tokens = " ".join(_format_binary_token(token) for token in parse_binary_tokens(body))
     else:
         tokens = "(vacio)"
     side = "Incoming" if direction == "Recv" else "Outgoing"
     return f"{side} [{header}] {tokens}"
 
 
-def _format_habbo_token(token) -> str:
+def encode_binary_message(text: str) -> bytes:
+    """Construye un mensaje binario completo a partir de texto.
+
+    Formato: "<header> <token> <token> ..." donde cada token es:
+      i:123      entero int32 big-endian
+      h:123      corto int16 big-endian
+      s:"texto"  cadena (longitud int16 BE + bytes UTF-8)
+      b:true     booleano (true/false/1/0)
+      u:0xFF     byte crudo
+
+    Devuelve [longitud int32 BE][header int16 BE][cuerpo].
+    """
+    tokens = text.split()
+    if not tokens:
+        raise ValueError("paquete vacio: indica el header y los campos")
+    try:
+        header = int(tokens[0], 0)
+    except ValueError as exc:
+        raise ValueError(f"header invalido: {tokens[0]}") from exc
+    body = bytearray()
+    for token in tokens[1:]:
+        kind, separator, value = token.partition(":")
+        if not separator:
+            raise ValueError(f"token sin tipo (usa i:/h:/s:/b:/u:): {token}")
+        try:
+            if kind == "i":
+                body += int(value, 0).to_bytes(4, "big", signed=True)
+            elif kind == "h":
+                body += int(value, 0).to_bytes(2, "big", signed=True)
+            elif kind == "s":
+                data = value.strip('"').encode("utf-8", "ignore")
+                body += len(data).to_bytes(2, "big") + data
+            elif kind == "b":
+                body += b"\x01" if value.lower() in ("1", "true", "v") else b"\x00"
+            elif kind == "u":
+                body += bytes([int(value, 0) & 0xFF])
+            else:
+                raise ValueError(f"tipo desconocido: {kind}")
+        except (ValueError, OverflowError) as exc:
+            raise ValueError(f"token invalido: {token}") from exc
+    return (2 + len(body)).to_bytes(4, "big") + header.to_bytes(2, "big") + bytes(body)
+
+
+def _try_xor_byte(data: bytes) -> str:
+    """Intenta descifrar con XOR de 1 byte y devuelve texto si parece legible.
+
+    Muchos juegos cifran el trafico saliente con un XOR simple de un byte:
+    se prueban las 256 claves y se conserva la que produce mas texto legible.
+    """
+    best_score = 0.0
+    best_text = ""
+    for key in range(256):
+        plain = bytes(byte ^ key for byte in data)
+        printable = sum(
+            1 for byte in plain if 32 <= byte < 127 or byte in (9, 10, 13)
+        )
+        score = printable / max(len(plain), 1)
+        if score > best_score:
+            best_score = score
+            best_text = plain.decode("ascii", "replace").rstrip("\x00")
+    if best_score >= 0.85:
+        return best_text
+    return ""
+
+
+def _format_unframed_payload(data: bytes) -> str:
+    """Formatea un payload sin framing: XOR legible si existe, hex si no."""
+    text = _try_xor_byte(data)
+    if text:
+        return text
+    return data.hex(" ")
+
+
+def _format_binary_token(token) -> str:
     kind, value = token
     if kind == "s":
         return f's:"{value}"'

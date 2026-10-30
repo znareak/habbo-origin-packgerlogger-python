@@ -64,29 +64,141 @@ assert callable(processio.find_process_connections)
 assert callable(processio.list_all_processes)
 print("processio OK")
 
-# 6. Decodificador Habbo (framing + parseo heuristico)
+# 6. Decodificador binario (framing + parseo heuristico)
 from app.capture import (
-    extract_habbo_frames,
-    format_habbo_message,
-    parse_habbo_tokens,
+    encode_binary_message,
+    extract_binary_frames,
+    format_binary_message,
+    parse_binary_tokens,
 )
 
 frame = (6).to_bytes(4, "big") + (2430).to_bytes(2, "big") + (2).to_bytes(4, "big")
-assert extract_habbo_frames(bytearray(frame)) == [(2430, (2).to_bytes(4, "big"))]
+assert extract_binary_frames(bytearray(frame)) == [(2430, (2).to_bytes(4, "big"))]
 
 split = (14).to_bytes(4, "big") + (10).to_bytes(2, "big") + (3).to_bytes(4, "big") + b"ab123456"
 buffer = bytearray(split[:5])
-assert extract_habbo_frames(buffer) == []
+assert extract_binary_frames(buffer) == []
 buffer.extend(split[5:])
-assert extract_habbo_frames(buffer) == [(10, (3).to_bytes(4, "big") + b"ab123456")]
+assert extract_binary_frames(buffer) == [(10, (3).to_bytes(4, "big") + b"ab123456")]
 
 # resincronizacion ante basura inicial
 buffer = bytearray((99999999).to_bytes(4, "big") + split)
-assert extract_habbo_frames(buffer) == [(10, (3).to_bytes(4, "big") + b"ab123456")]
+assert extract_binary_frames(buffer) == [(10, (3).to_bytes(4, "big") + b"ab123456")]
 
-tokens = parse_habbo_tokens((2).to_bytes(4, "big") + (5).to_bytes(2, "big") + b"habbo")
-assert tokens == [("i", 2), ("s", "habbo")]
-assert format_habbo_message("Recv", 2430, (2).to_bytes(4, "big")) == "Incoming [2430] i:2"
-print("habbo OK")
+tokens = parse_binary_tokens((2).to_bytes(4, "big") + (5).to_bytes(2, "big") + b"hello")
+assert tokens == [("i", 2), ("s", "hello")]
+assert format_binary_message("Recv", 2430, (2).to_bytes(4, "big")) == "Incoming [2430] i:2"
+print("binary OK")
+
+# 7. Codificador binario (framing para envio)
+message = encode_binary_message('143 s:"hello_world" i:19 b:true u:0xFF')
+frames = extract_binary_frames(bytearray(message))
+assert frames == [(143, (11).to_bytes(2, "big") + b"hello_world" + (19).to_bytes(4, "big") + b"\x01\xff")]
+assert format_binary_message("Send", frames[0][0], frames[0][1]).startswith("Outgoing [143]")
+print("binary encode OK")
+
+# 8. Inyector: prueba local de extremo a extremo (socket duplicado + send)
+import socket
+import subprocess
+import threading
+import time
+
+import psutil
+
+from app.processio import SocketInjector, find_tcp_connections
+
+received = []
+accepted = False
+ready = threading.Event()
+ready_port = []
+
+
+def serve():
+    global accepted
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        ready_port.append(server.getsockname()[1])
+        ready.set()
+        connection, _ = server.accept()
+        accepted = True
+        received.append(connection.recv(1024))
+
+
+thread = threading.Thread(target=serve, daemon=True)
+thread.start()
+assert ready.wait(5), "el servidor de prueba no arranco"
+client_code = (
+    "import socket,time;"
+    "s=socket.socket();"
+    f"s.connect(('127.0.0.1',{ready_port[0]}));"
+    "time.sleep(10)"
+)
+child = subprocess.Popen([sys.executable, "-c", client_code])
+time.sleep(1)
+try:
+    # El python.exe del venv es un lanzador que arranca el interprete real con
+    # otro PID: localizar el proceso que posee la conexion por el puerto.
+    target_pid = None
+    for connection in psutil.net_connections(kind="tcp"):
+        if (
+            connection.status == psutil.CONN_ESTABLISHED
+            and connection.raddr
+            and connection.raddr.port == ready_port[0]
+            and connection.pid
+        ):
+            target_pid = connection.pid
+            break
+    assert target_pid, "no se encontro la conexion del cliente de prueba"
+    process = psutil.Process(target_pid)
+    connections = find_tcp_connections(process)
+    print("conexiones vistas por psutil:", connections)
+    injector = SocketInjector(process)
+    assert injector.connect(ports=(ready_port[0],)), "no se pudo conectar al cliente de prueba"
+    sent = injector.send("Send", "hola servidor")
+    assert sent == len(b"hola servidor"), sent
+    thread.join(5)
+    assert received and received[0] == b"hola servidor", received
+    injector.close()
+finally:
+    child.terminate()
+print("inyector local OK")
+
+# 9. Decodificacion binaria: fallback a hex para flujos sin framing
+from app.capture import NpcapCaptureSource
+
+try:
+    import scapy.all as sp
+
+    source = NpcapCaptureSource(
+        connection={
+            "proto": "tcp",
+            "local_ip": "127.0.0.1",
+            "local_port": 1,
+            "remote_ip": "1.2.3.4",
+            "remote_port": 30000,
+        }
+    )
+    source.info = dict(source.connection)
+    source.binary_decode = True
+    emitted = []
+    source.emit = emitted.append
+
+    # Saliente sin framing (bytes cortos): debe mostrarse en hex, no descartarse
+    raw = bytes.fromhex("1a 81 7a fa 06 ab")
+    packet = sp.Ether() / sp.IP() / sp.TCP(sport=1234, dport=1) / sp.Raw(load=raw)
+    source._on_packet(packet)
+    assert emitted and emitted[0].data == raw.hex(" "), emitted
+    emitted.clear()
+
+    # Entrante con framing: debe decodificarse
+    framed = (6).to_bytes(4, "big") + (2430).to_bytes(2, "big") + (2).to_bytes(4, "big")
+    packet = sp.Ether() / sp.IP() / sp.TCP(sport=30000, dport=1) / sp.Raw(load=framed)
+    source._on_packet(packet)
+    assert emitted and emitted[0].data == "Incoming [2430] i:2", emitted
+    print("binary fallback OK")
+except ImportError:
+    print("binary fallback OK (sin scapy, omitido)")
 
 print("TODAS LAS PRUEBAS OK")

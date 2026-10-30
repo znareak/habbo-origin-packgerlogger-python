@@ -63,6 +63,46 @@ def _relaunch_in_venv() -> None:
         sys.exit(1)
 
 
+def _is_admin() -> bool:
+    """True si el proceso actual tiene permisos de Administrador."""
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _relaunch_as_admin() -> None:
+    """Solicita elevacion UAC y relanza el programa como Administrador.
+
+    Si el usuario acepta, este proceso termina y el elevado abre la interfaz.
+    Si rechaza, se continua sin permisos (la inyeccion no funcionara).
+    """
+    import ctypes
+
+    print("[*] Solicitando permisos de Administrador (confirma el aviso UAC)...")
+    script = os.path.abspath(__file__)
+    params = " ".join(f'"{arg}"' for arg in [script, *sys.argv[1:]])
+    ctypes.windll.shell32.ShellExecuteW.restype = ctypes.c_ulonglong
+    ctypes.windll.shell32.ShellExecuteW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+    ]
+    result = ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", sys.executable, params, os.path.dirname(script), 1
+    )
+    if result <= 32:
+        print(f"[!] No se pudo elevar el proceso (codigo {result}).")
+        print("    El programa seguira sin permisos: la inyeccion no funcionara.")
+        return
+    sys.exit(0)
+
+
 def main() -> None:
     try:
         print(BANNER)
@@ -70,6 +110,8 @@ def main() -> None:
         # Salida redirigida con codificacion antigua (p. ej. cp1252): degradar el banner
         print(BANNER.encode("ascii", "replace").decode("ascii"))
     _relaunch_in_venv()
+    if not _is_admin() and not os.environ.get("PACKETLOGGER_NO_GUI"):
+        _relaunch_as_admin()
     try:
         from app.ui import App, run
     except ModuleNotFoundError as exc:

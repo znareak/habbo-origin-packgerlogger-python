@@ -21,6 +21,8 @@ import psutil
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
 ws2_32 = ctypes.WinDLL("ws2_32", use_last_error=True)
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+shell32.IsUserAnAdmin.restype = wintypes.BOOL
 
 PROCESS_VM_READ = 0x0010
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -215,9 +217,17 @@ def find_process_connections(proc: psutil.Process) -> List[dict]:
     return find_tcp_connections(proc, None) + find_udp_endpoints(proc)
 
 
-# Puertos tipicos de servidores de juegos online (Habbo y similares):
+# Puertos tipicos de servidores de juegos online:
 # 30000-30199 = puerto de juego, 20000-20099 = lobby/auth.
 GAME_PORT_RANGES = ((30000, 30199), (20000, 20099))
+
+
+def is_admin() -> bool:
+    """True si el proceso actual se ejecuta con permisos de Administrador."""
+    try:
+        return bool(shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 def score_tcp_connection(connection: dict) -> int:
@@ -277,6 +287,12 @@ def enumerate_process_handles(process_handle: wintypes.HANDLE) -> List[int]:
     Mas fiable que la enumeracion global (funciona con PIDs grandes y requiere
     menos privilegios).
     """
+    handles, _status = _query_process_handles(process_handle)
+    return handles
+
+
+def _query_process_handles(process_handle: wintypes.HANDLE):
+    """Devuelve (lista_de_handles, status_nt) de NtQueryInformationProcess."""
     length = wintypes.ULONG(0x10000)
     needed = wintypes.ULONG(0)
     for _ in range(10):
@@ -292,15 +308,15 @@ def enumerate_process_handles(process_handle: wintypes.HANDLE) -> List[int]:
             length.value = max(needed.value * 2, length.value * 2)
             continue
         if status != 0:
-            return []
+            return [], status
         snapshot = ctypes.cast(buffer, ctypes.POINTER(PROCESS_HANDLE_SNAPSHOT_INFORMATION))
         count = snapshot.contents.NumberOfHandles
         entries = ctypes.cast(
             ctypes.addressof(snapshot.contents.Handles),
             ctypes.POINTER(PROCESS_HANDLE_TABLE_ENTRY_INFO * count),
         )
-        return [entry.HandleValue for entry in entries.contents]
-    return []
+        return [entry.HandleValue for entry in entries.contents], 0
+    return [], 0
 
 
 def enumerate_system_handles(pid: int) -> List[int]:
@@ -331,7 +347,8 @@ def enumerate_system_handles(pid: int) -> List[int]:
     return []
 
 
-def duplicate_handle(process_handle: wintypes.HANDLE, handle_value: int) -> Optional[wintypes.HANDLE]:
+def duplicate_handle(process_handle: wintypes.HANDLE, handle_value: int):
+    """Duplica un handle del proceso objetivo. Devuelve (handle, error_win) o (None, codigo)."""
     target = wintypes.HANDLE()
     current = kernel32.GetCurrentProcess()
     try:
@@ -344,9 +361,9 @@ def duplicate_handle(process_handle: wintypes.HANDLE, handle_value: int) -> Opti
             False,
             MAXIMUM_ALLOWED,
         )
-    except OSError:
-        return None
-    return target if target.value else None
+    except OSError as exc:
+        return None, exc.winerror or ctypes.get_last_error()
+    return (target if target.value else None), 0
 
 
 def is_tcp_socket(handle: wintypes.HANDLE) -> bool:
@@ -373,7 +390,11 @@ def send_on_socket(handle: wintypes.HANDLE, data: bytes) -> int:
     if not data:
         return 0
     buffer = ctypes.create_string_buffer(data, len(data))
-    return ws2_32.send(handle, buffer, len(data), 0)
+    sent = ws2_32.send(handle, buffer, len(data), 0)
+    if sent < 0:
+        # SOCKET_ERROR: incluir el codigo de error de Winsock en el mensaje
+        raise OSError(ctypes.get_last_error(), "ws2_32.send fallo")
+    return sent
 
 
 def read_process_memory(process_handle: wintypes.HANDLE, address: int, size: int) -> Optional[bytes]:
@@ -402,7 +423,10 @@ class SocketInjector:
     def __init__(self, process: psutil.Process):
         self.process = process
         self.pid = process.pid
-        self.name = process.info.get("name") if process.info else str(process.pid)
+        try:
+            self.name = process.name() or str(process.pid)
+        except Exception:
+            self.name = str(process.pid)
         self.process_handle: Optional[wintypes.HANDLE] = None
         self.socket_handle: Optional[wintypes.HANDLE] = None
         self.remote: Optional[Tuple[str, int]] = None
@@ -447,43 +471,111 @@ class SocketInjector:
         target_remote = (chosen["remote_ip"], chosen["remote_port"])
 
         checked = 0
-        handle_values = enumerate_process_handles(self.process_handle)
+        duplicate_failures = 0
+        first_dup_error = 0
+        tcp_peers = []
+        handle_values, nt_status = _query_process_handles(self.process_handle)
+        handle_values = [value for value in handle_values if value]
         if not handle_values:
             handle_values = enumerate_system_handles(self.pid)
+        total = len(handle_values)
+
+        def try_socket(duplicated: wintypes.HANDLE) -> bool:
+            """Comprueba si el handle es el socket TCP objetivo (y lo registra)."""
+            if not is_tcp_socket(duplicated):
+                return False
+            peer = socket_remote(duplicated)
+            if peer is not None and peer not in tcp_peers and len(tcp_peers) < 5:
+                tcp_peers.append(peer)
+            if peer == target_remote:
+                self.socket_handle = duplicated
+                self.remote = target_remote
+                return True
+            return False
+
         for handle_value in handle_values:
-            duplicated = duplicate_handle(self.process_handle, handle_value)
+            duplicated, dup_error = duplicate_handle(self.process_handle, handle_value)
             if duplicated is None:
+                duplicate_failures += 1
+                if not first_dup_error:
+                    first_dup_error = dup_error
                 continue
             checked += 1
             try:
-                if is_tcp_socket(duplicated) and socket_remote(duplicated) == target_remote:
-                    self.socket_handle = duplicated
-                    self.remote = target_remote
+                if try_socket(duplicated):
                     return True
                 kernel32.CloseHandle(duplicated)
             except OSError:
                 pass
-        if checked == 0:
+        if self.socket_handle is None:
+            # Respaldo: escanear valores de handle tipicos (el parseo de la tabla
+            # puede fallar en algunas versiones de Windows).
+            for handle_value in range(4, 0x10000, 4):
+                duplicated, _dup_error = duplicate_handle(self.process_handle, handle_value)
+                if duplicated is None:
+                    continue
+                checked += 1
+                try:
+                    if try_socket(duplicated):
+                        return True
+                    kernel32.CloseHandle(duplicated)
+                except OSError:
+                    pass
+        if checked == 0 and total == 0:
+            if nt_status in (0xC0000022, 0xC0000005):
+                hint = (
+                    f"No se pudo enumerar los handles del proceso (acceso denegado, "
+                    f"NT 0x{nt_status & 0xFFFFFFFF:08X}). Ejecuta el programa como "
+                    "Administrador."
+                )
+            else:
+                hint = (
+                    f"No se pudo enumerar ningun handle del proceso (NT "
+                    f"0x{nt_status & 0xFFFFFFFF:08X}). Ejecuta el programa como "
+                    "Administrador; si ya lo haces, el proceso puede estar protegido."
+                )
+        elif checked == 0:
             hint = (
-                "No se pudo enumerar ningun handle del proceso. Ejecuta el programa "
-                "como Administrador; si ya lo haces, el proceso puede estar protegido."
+                f"Se enumeraron {total} handles pero ninguno pudo duplicarse "
+                f"({duplicate_failures} fallos de DuplicateHandle, primer error "
+                f"WinError {first_dup_error}). El proceso protege sus handles o no "
+                "tienes permisos suficientes (ejecuta como Administrador)."
             )
         else:
+            if tcp_peers:
+                peers_text = ", ".join(f"{ip}:{port}" for ip, port in tcp_peers)
+                peers_info = f" Sockets TCP vistos: {peers_text}."
+            else:
+                peers_info = " No se encontro ningun socket TCP entre los handles."
             hint = (
-                "Ejecuta el programa como Administrador; si ya lo haces, el proceso "
-                "puede estar protegiendo sus handles."
+                f"Se comprobaron {checked} handles sin hallar el socket "
+                f"{target_remote[0]}:{target_remote[1]}.{peers_info}\n"
+                "Si aparece otro socket, elige esa conexion en el inyector; si no "
+                "hay ninguno, el proceso puede estar protegiendo su socket."
             )
         raise RuntimeError(
             f"No se pudo duplicar el socket de {target_remote[0]}:{target_remote[1]} "
-            f"(se comprobaron {checked} handles del proceso).\n{hint}"
+            f"(se comprobaron {checked} de {total} handles del proceso).\n{hint}"
         )
 
-    def send(self, direction: str, text: str) -> int:
-        """Envia un paquete por el socket duplicado. Devuelve bytes enviados."""
+    def send(self, direction: str, text) -> int:
+        """Envia un paquete (texto o bytes) por el socket duplicado.
+
+        Devuelve bytes enviados. Lanza RuntimeError con el detalle si falla.
+        """
         if self.socket_handle is None:
             raise RuntimeError("Inyector no conectado: no hay socket duplicado")
-        data = text.encode("ascii", "ignore")
-        sent = send_on_socket(self.socket_handle, data)
+        if isinstance(text, str):
+            data = text.encode("ascii", "ignore")
+        else:
+            data = bytes(text)
+        try:
+            sent = send_on_socket(self.socket_handle, data)
+        except OSError as exc:
+            raise RuntimeError(
+                f"send() fallo (error Winsock {exc.errno}: {exc.strerror}). "
+                "La conexion puede haberse cerrado o el proceso cerro el socket."
+            ) from exc
         if sent != len(data):
             raise RuntimeError(f"send() incompleto: {sent}/{len(data)} bytes")
         return sent

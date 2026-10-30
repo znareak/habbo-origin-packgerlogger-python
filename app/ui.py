@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
 
-from .capture import NpcapCaptureSource
+from .capture import NpcapCaptureSource, encode_binary_message
 from .filesource import FilePacketSource, FileReplayer
 from .filters import PacketFilter, ProfileStore
 from .models import Packet
@@ -26,6 +26,7 @@ from .processio import (
     best_tcp_connection,
     find_process_connections,
     find_tcp_connections,
+    is_admin,
     list_all_processes,
 )
 
@@ -356,35 +357,39 @@ class SendPanel(ttk.LabelFrame):
         self.on_send = on_send  # on_send(direction, text)
         self.injectors_provider = injectors_provider  # -> (labels, selected_index)
 
+        # Fila de controles: direccion, inyector y acciones de envio
         row = ttk.Frame(self)
-        row.pack(fill="x", padx=8, pady=4)
+        row.pack(fill="x", padx=8, pady=(4, 2))
         ttk.Label(row, text="Direccion:").pack(side="left")
         self.direction_var = tk.StringVar(value="Send")
         ttk.Combobox(
             row, textvariable=self.direction_var, state="readonly", width=6, values=("Send", "Recv")
         ).pack(side="left", padx=2)
 
-        ttk.Label(row, text="Inyector:").pack(side="left", padx=(10, 2))
+        ttk.Label(row, text="Inyector:").pack(side="left", padx=(8, 2))
         self.injector_var = tk.StringVar(value="")
-        self.injector_combo = ttk.Combobox(row, textvariable=self.injector_var, state="readonly", width=30)
+        self.injector_combo = ttk.Combobox(row, textvariable=self.injector_var, state="readonly", width=20)
         self.injector_combo.pack(side="left", padx=2)
         ttk.Button(row, text="Actualizar", command=self.refresh_injectors).pack(side="left", padx=4)
 
-        entry_row = ttk.Frame(self)
-        entry_row.pack(fill="x", padx=8, pady=4)
-        ttk.Label(entry_row, text="Paquete:").pack(side="left")
-        self.packet_var = tk.StringVar()
-        ttk.Entry(entry_row, textvariable=self.packet_var).pack(side="left", fill="x", expand=True, padx=4)
-
-        btn_row = ttk.Frame(self)
-        btn_row.pack(fill="x", padx=8, pady=4)
-        ttk.Button(btn_row, text="Enviar una vez", command=self.send_once).pack(side="left")
-        ttk.Label(btn_row, text="Intervalo (s):").pack(side="left", padx=(10, 2))
+        ttk.Button(row, text="Enviar", command=self.send_once).pack(side="left", padx=(6, 0))
+        ttk.Label(row, text="Intervalo (s):").pack(side="left", padx=(8, 2))
         self.interval_var = tk.DoubleVar(value=1.0)
-        ttk.Spinbox(btn_row, from_=0.1, to=3600, increment=0.1, textvariable=self.interval_var, width=7).pack(side="left")
-        self.periodic_button = ttk.Button(btn_row, text="Iniciar periodico", command=self.toggle_periodic)
+        ttk.Spinbox(
+            row, from_=0.1, to=3600, increment=0.1, textvariable=self.interval_var, width=7
+        ).pack(side="left")
+        self.periodic_button = ttk.Button(row, text="Periodico", command=self.toggle_periodic)
         self.periodic_button.pack(side="left", padx=4)
         self._periodic_active = False
+
+        # Fila del paquete (ancho completo, nunca se corta)
+        entry_row = ttk.Frame(self)
+        entry_row.pack(fill="x", padx=8, pady=(2, 6))
+        ttk.Label(entry_row, text="Paquete:").pack(side="left")
+        self.packet_var = tk.StringVar()
+        self.packet_entry = ttk.Entry(entry_row, textvariable=self.packet_var)
+        self.packet_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self.packet_entry.bind("<Return>", lambda _event: self.send_once())
 
         self._set_periodic(False)
 
@@ -393,7 +398,7 @@ class SendPanel(ttk.LabelFrame):
 
     def _set_periodic(self, active: bool) -> None:
         self._periodic_active = active
-        self.periodic_button.configure(text="Detener periodico" if active else "Iniciar periodico")
+        self.periodic_button.configure(text="Detener" if active else "Periodico")
 
     def send_once(self) -> None:
         text = self.packet_var.get().strip()
@@ -428,6 +433,7 @@ class SourceTab(ttk.Frame):
         self.source = source
         self.app = app
         self.queue: "queue.Queue[Packet]" = queue.Queue()
+        self.error_queue: "queue.Queue[str]" = queue.Queue()
         self._started = False
         self._periodic_id: Optional[str] = None
         self._replayer: Optional[FileReplayer] = None
@@ -443,10 +449,10 @@ class SourceTab(ttk.Frame):
         ttk.Checkbutton(
             toolbar, text="Auto-scroll", variable=self.autoscroll_var
         ).pack(side="left")
-        self.habbo_var = tk.BooleanVar(value=False)
+        self.decode_var = tk.BooleanVar(value=False)
         if isinstance(source, NpcapCaptureSource):
             ttk.Checkbutton(
-                toolbar, text="Habbo", variable=self.habbo_var, command=self._toggle_habbo
+                toolbar, text="Decodificar", variable=self.decode_var, command=self._toggle_decode
             ).pack(side="left", padx=4)
         self.status_var = tk.StringVar(value="Detenido")
         ttk.Label(toolbar, textvariable=self.status_var, foreground="#9a9a9a").pack(side="right")
@@ -525,7 +531,7 @@ class SourceTab(ttk.Frame):
                 self._started = True
                 self.start_button.configure(text="Detener", state="normal")
             except Exception as exc:
-                self.status_var.set(f"Error: {exc}")
+                self._report_error(f"Error al iniciar la captura: {exc}")
                 self.start_button.configure(state="normal")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -547,14 +553,14 @@ class SourceTab(ttk.Frame):
     def _clear(self) -> None:
         self.grid.clear()
 
-    def _toggle_habbo(self) -> None:
-        """Activa o desactiva la decodificacion del protocolo Habbo en la captura."""
+    def _toggle_decode(self) -> None:
+        """Activa o desactiva la decodificacion del protocolo binario en la captura."""
         if isinstance(self.source, NpcapCaptureSource):
-            self.source.habbo_decode = self.habbo_var.get()
+            self.source.binary_decode = self.decode_var.get()
             self.status_var.set(
-                "Decodificacion Habbo activada"
-                if self.habbo_var.get()
-                else "Decodificacion Habbo desactivada"
+                "Decodificacion binaria activada"
+                if self.decode_var.get()
+                else "Decodificacion binaria desactivada"
             )
 
     # -- cola de paquetes ------------------------------------------------
@@ -568,10 +574,25 @@ class SourceTab(ttk.Frame):
             pass
         except tk.TclError:
             return
+        # Errores pendientes: mostrarlos en una ventana emergente (hilo de UI)
+        try:
+            while True:
+                message = self.error_queue.get_nowait()
+                try:
+                    messagebox.showerror("Error", message, parent=self.winfo_toplevel())
+                except tk.TclError:
+                    pass
+        except queue.Empty:
+            pass
         try:
             self.after(100, self._poll_queue)
         except tk.TclError:
             pass
+
+    def _report_error(self, message: str) -> None:
+        """Muestra el error en la barra de estado y en una ventana emergente."""
+        self.status_var.set(message)
+        self.error_queue.put(message)
 
     def _add_packet(self, packet: Packet) -> None:
         if not self._filter_match(packet):
@@ -610,13 +631,24 @@ class SourceTab(ttk.Frame):
             )
             return
 
+        payload: "str | bytes" = text
+        hint = ""
+        if isinstance(self.source, NpcapCaptureSource) and self.decode_var.get():
+            # Con la decodificacion activa, construir el framing binario del mensaje
+            try:
+                payload = encode_binary_message(text)
+                hint = " (framing binario)"
+            except ValueError as exc:
+                self._report_error(f"Error en el paquete binario: {exc}")
+                return
+
         def worker():
             with self._send_lock:
                 try:
-                    sent = injector.send(direction, text)
-                    self.status_var.set(f"Enviado {sent} bytes ({direction})")
+                    sent = injector.send(direction, payload)
+                    self.status_var.set(f"Enviado {sent} bytes ({direction}){hint}")
                 except Exception as exc:
-                    self.status_var.set(f"Error al enviar: {exc}")
+                    self._report_error(f"Error al enviar: {exc}")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -693,7 +725,7 @@ class SourceTab(ttk.Frame):
                     time.sleep(max(0.1, self.replay_interval_var.get()))
                 self.status_var.set("Reproduccion finalizada")
             except Exception as exc:
-                self.status_var.set(f"Reproduccion detenida: {exc}")
+                self._report_error(f"Reproduccion detenida: {exc}")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1378,11 +1410,17 @@ class App(tk.Tk):
         sources_menu.add_command(label="Captura Npcap (cualquier proceso)...", command=self._add_capture)
         sources_menu.add_command(label="Archivo de paquetes...", command=self._add_file)
         sources_menu.add_separator()
+        self.recent_captures_menu = tk.Menu(sources_menu, tearoff=0, **menu_colors)
+        sources_menu.add_cascade(label="Capturas recientes", menu=self.recent_captures_menu)
+        sources_menu.add_separator()
         sources_menu.add_command(label="Cerrar pestaña activa", command=self._close_active_tab)
         menubar.add_cascade(label="Fuentes", menu=sources_menu)
 
         injector_menu = tk.Menu(menubar, tearoff=0, **menu_colors)
         injector_menu.add_command(label="Nuevo inyector...", command=self._add_injector)
+        injector_menu.add_separator()
+        self.recent_injectors_menu = tk.Menu(injector_menu, tearoff=0, **menu_colors)
+        injector_menu.add_cascade(label="Inyectores recientes", menu=self.recent_injectors_menu)
         injector_menu.add_command(label="Cerrar todos los inyectores", command=self._close_injectors)
         menubar.add_cascade(label="Inyectores", menu=injector_menu)
 
@@ -1396,6 +1434,125 @@ class App(tk.Tk):
         menubar.add_cascade(label="Ayuda", menu=help_menu)
 
         self.config(menu=menubar)
+        self._rebuild_recent_menus()
+
+    # -- conexiones recientes --------------------------------------------
+
+    def _remember_capture(self, connection, process) -> None:
+        if not connection:
+            return
+        try:
+            process_name = process.name() if process is not None else ""
+        except Exception:
+            process_name = ""
+        entry = {
+            "proto": connection.get("proto", "tcp"),
+            "local_ip": connection.get("local_ip", ""),
+            "local_port": connection.get("local_port", 0),
+            "remote_ip": connection.get("remote_ip", ""),
+            "remote_port": connection.get("remote_port", 0),
+            "process_name": process_name,
+        }
+        recent = self.settings.setdefault("recent_captures", [])
+        recent = [
+            item for item in recent
+            if not (item.get("remote_ip") == entry["remote_ip"] and item.get("remote_port") == entry["remote_port"])
+        ]
+        recent.insert(0, entry)
+        self.settings["recent_captures"] = recent[:10]
+        save_settings(self.settings)
+        self._rebuild_recent_menus()
+
+    def _remember_injector(self, injector: SocketInjector) -> None:
+        if not injector.remote:
+            return
+        entry = {
+            "process_name": injector.name,
+            "remote_ip": injector.remote[0],
+            "remote_port": injector.remote[1],
+        }
+        recent = self.settings.setdefault("recent_injectors", [])
+        recent = [
+            item for item in recent
+            if not (item.get("remote_ip") == entry["remote_ip"] and item.get("remote_port") == entry["remote_port"])
+        ]
+        recent.insert(0, entry)
+        self.settings["recent_injectors"] = recent[:10]
+        save_settings(self.settings)
+        self._rebuild_recent_menus()
+
+    def _rebuild_recent_menus(self) -> None:
+        menus = (
+            (self.recent_captures_menu, self.settings.get("recent_captures", []), self._open_recent_capture),
+            (self.recent_injectors_menu, self.settings.get("recent_injectors", []), self._open_recent_injector),
+        )
+        for menu, entries, handler in menus:
+            menu.delete(0, "end")
+            if not entries:
+                menu.add_command(label="(vacio)", state="disabled")
+                continue
+            for entry in entries:
+                label = (
+                    f"{entry.get('remote_ip', '?')}:{entry.get('remote_port', '?')} "
+                    f"- {entry.get('process_name') or 'desconocido'}"
+                )
+                menu.add_command(label=label, command=lambda e=entry: handler(e))
+
+    def _open_recent_capture(self, entry: dict) -> None:
+        connection = {
+            "proto": entry.get("proto", "tcp"),
+            "local_ip": entry.get("local_ip", ""),
+            "local_port": entry.get("local_port", 0),
+            "remote_ip": entry.get("remote_ip", ""),
+            "remote_port": entry.get("remote_port", 0),
+        }
+        source = NpcapCaptureSource(connection=connection)
+        title = (
+            f"Captura {connection['proto'].upper()} "
+            f"{connection['remote_ip']}:{connection['remote_port']}"
+        )
+        tab = self.add_source_tab(title, source)
+        source.emit = lambda packet: tab.queue.put(packet)
+        # La captura reciente se inicia automaticamente
+        tab.start()
+
+    def _open_recent_injector(self, entry: dict) -> None:
+        if not is_admin():
+            messagebox.showwarning(
+                "Inyector",
+                "El programa no se ejecuta como Administrador.\n"
+                "Reinicia el programa con permisos de Administrador para poder inyectar.",
+                parent=self,
+            )
+            return
+        target_name = (entry.get("process_name") or "").lower()
+        process = None
+        for proc in list_all_processes():
+            try:
+                name = (proc.name() or "").lower()
+            except Exception:
+                continue
+            if target_name and name == target_name:
+                process = proc
+                break
+        if process is None:
+            messagebox.showwarning(
+                "Inyector",
+                f"No se encontro el proceso '{entry.get('process_name') or '?'}' en "
+                "ejecucion. Abrelo antes de reutilizar el inyector.",
+                parent=self,
+            )
+            return
+        injector = SocketInjector(process)
+        try:
+            injector.connect(target=(entry["remote_ip"], entry["remote_port"]))
+        except RuntimeError as exc:
+            messagebox.showerror("Inyector", str(exc), parent=self)
+            injector.close()
+            return
+        self.injectors.append(injector)
+        self._refresh_all_send_panels()
+        self.status_text.set(f"Inyector conectado a {injector.remote}")
 
     def _build_panes(self) -> None:
         self.paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
@@ -1416,7 +1573,16 @@ class App(tk.Tk):
         ttk.Label(bar, textvariable=self.status_text, padding=(6, 2)).pack(side="left")
         self.npcap_text = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self.npcap_text, padding=(6, 2)).pack(side="right")
+        self.admin_text = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self.admin_text, padding=(6, 2)).pack(side="right")
         self._check_npcap()
+        self._check_admin()
+
+    def _check_admin(self) -> None:
+        if is_admin():
+            self.admin_text.set("Administrador: SI")
+        else:
+            self.admin_text.set("Administrador: NO (necesario para inyectar)")
 
     def _check_npcap(self) -> None:
         try:
@@ -1459,6 +1625,7 @@ class App(tk.Tk):
         tab = self.add_source_tab(title, source)
         # Conectar el hilo de captura a la cola de la pestaña
         source.emit = lambda packet: tab.queue.put(packet)
+        self._remember_capture(connection, result["process"])
 
     def _add_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -1489,6 +1656,15 @@ class App(tk.Tk):
     # -- inyectores -------------------------------------------------------
 
     def _add_injector(self) -> None:
+        if not is_admin():
+            messagebox.showwarning(
+                "Inyector",
+                "El programa no se ejecuta como Administrador.\n"
+                "Cierra el programa y vuelve a abrirlo desde una terminal "
+                "elevada (como Administrador) para poder inyectar.",
+                parent=self,
+            )
+            return
         dialog = InjectorDialog(self, self.settings)
         self.wait_window(dialog)
         if not dialog.result:
@@ -1510,6 +1686,7 @@ class App(tk.Tk):
         self.injectors.append(injector)
         self._refresh_all_send_panels()
         self.status_text.set(f"Inyector conectado a {injector.remote}")
+        self._remember_injector(injector)
 
     def _close_injectors(self) -> None:
         for injector in self.injectors:

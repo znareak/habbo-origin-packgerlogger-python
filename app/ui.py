@@ -102,30 +102,56 @@ class PacketGrid(ttk.Frame):
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
 
-        # Panel de detalle: paquete seleccionado completo (se puede seleccionar y copiar)
+        # Panel de detalle: paquete seleccionado completo, con salto de linea
+        # para que el contenido largo nunca se corte.
+        self._max_data_len = 0
         detail_frame = ttk.Frame(self)
-        detail_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Label(detail_frame, text="Paquete seleccionado:").pack(side="left")
-        self.detail_var = tk.StringVar(value="")
-        self.detail_entry = ttk.Entry(detail_frame, textvariable=self.detail_var, state="readonly")
-        self.detail_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
-        ttk.Button(detail_frame, text="Copiar", command=self.copy_packet).pack(side="left", padx=4)
+        detail_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+        detail_frame.rowconfigure(1, weight=1)
+        detail_frame.columnconfigure(0, weight=1)
+        detail_header = ttk.Frame(detail_frame)
+        detail_header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(detail_header, text="Paquete seleccionado (completo):").pack(side="left")
+        ttk.Button(detail_header, text="Copiar", command=self.copy_packet).pack(side="left", padx=4)
+        self.detail_text = tk.Text(
+            detail_frame,
+            height=4,
+            wrap="word",
+            state="disabled",
+            background="#f5f5f5",
+            relief="solid",
+            borderwidth=1,
+        )
+        detail_vsb = ttk.Scrollbar(detail_frame, orient="vertical", command=self.detail_text.yview)
+        self.detail_text.configure(yscrollcommand=detail_vsb.set)
+        self.detail_text.grid(row=1, column=0, sticky="nsew")
+        detail_vsb.grid(row=1, column=1, sticky="ns")
 
         # Menu contextual y atajo de teclado
         self._menu = tk.Menu(self, tearoff=0)
         self._menu.add_command(label="Copiar paquete", command=self.copy_packet)
         self._menu.add_command(label="Copiar linea completa", command=self.copy_line)
+        self._menu.add_separator()
+        self._menu.add_command(label="Limpiar pantalla", command=self.clear)
         self.tree.bind("<Button-3>", self._on_right_click)
         self.tree.bind("<Control-c>", lambda _event: self.copy_line())
+        self.tree.bind("<Control-l>", lambda _event: self.clear())
 
         self._on_select = on_select
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
     def _on_tree_select(self, _event=None) -> None:
         packet = self.selected()
-        self.detail_var.set(packet.data if packet is not None else "")
+        self._set_detail(packet.data if packet is not None else "")
         if self._on_select is not None:
             self._on_select(packet)
+
+    def _set_detail(self, text: str) -> None:
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", "end")
+        if text:
+            self.detail_text.insert("1.0", text)
+        self.detail_text.configure(state="disabled")
 
     def _on_right_click(self, event) -> None:
         row = self.tree.identify_row(event.y)
@@ -140,7 +166,10 @@ class PacketGrid(ttk.Frame):
     def copy_packet(self) -> None:
         """Copia al portapapeles el contenido del paquete seleccionado."""
         packet = self.selected()
-        text = packet.data if packet is not None else self.detail_var.get()
+        if packet is not None:
+            text = packet.data
+        else:
+            text = self.detail_text.get("1.0", "end").strip()
         if not text:
             return
         self.clipboard_clear()
@@ -164,10 +193,15 @@ class PacketGrid(ttk.Frame):
             self.tree.delete(children[0])
         if autoscroll:
             self.tree.see(children[-1])
+        # Amplia la columna de datos cuando llega un paquete mas largo
+        if len(packet.data) > self._max_data_len:
+            self._max_data_len = len(packet.data)
+            width = min(400 + self._max_data_len * 7, 1400)
+            self.tree.column("data", width=width)
 
     def clear(self) -> None:
         self.tree.delete(*self.tree.get_children())
-        self.detail_var.set("")
+        self._set_detail("")
 
     def selected(self) -> Optional[Packet]:
         selection = self.tree.selection()
@@ -733,6 +767,9 @@ class CaptureDialog(tk.Toplevel):
         if self.proc_var.get() not in labels:
             chosen = prefer if prefer in labels else (labels[0] if labels else "")
             self.proc_var.set(chosen)
+        # Si la busqueda deja un unico proceso, mostrar sus conexiones directamente
+        if len(labels) == 1 and self.proc_var.get() == labels[0]:
+            self._load_connections()
 
     def _on_search(self, *_args) -> None:
         self._apply_search()
@@ -865,6 +902,9 @@ class InjectorDialog(tk.Toplevel):
         if self.proc_var.get() not in labels:
             chosen = prefer if prefer in labels else (labels[0] if labels else "")
             self.proc_var.set(chosen)
+        # Si la busqueda deja un unico proceso, mostrar sus conexiones directamente
+        if len(labels) == 1 and self.proc_var.get() == labels[0]:
+            self._load_connections()
 
     def _on_search(self, *_args) -> None:
         self._apply_search()

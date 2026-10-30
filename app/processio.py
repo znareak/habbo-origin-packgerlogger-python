@@ -684,3 +684,147 @@ class SocketInjector:
     def __repr__(self) -> str:  # pragma: no cover
         state = f"{self.remote[0]}:{self.remote[1]}" if self.remote else "sin conexion"
         return f"{self.name} ({state})"
+
+
+# ---------------------------------------------------------------------------
+# Escaneo de memoria (busqueda del estado RC4 del proceso)
+# ---------------------------------------------------------------------------
+
+MEM_COMMIT = 0x1000
+MEM_PRIVATE = 0x20000
+PAGE_READONLY = 0x02
+PAGE_READWRITE = 0x04
+PAGE_WRITECOPY = 0x08
+PAGE_EXECUTE_READ = 0x20
+PAGE_EXECUTE_READWRITE = 0x40
+PAGE_EXECUTE_WRITECOPY = 0x80
+
+_READABLE_PROTECTS = {
+    PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+}
+
+
+class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress", ctypes.c_void_p),
+        ("AllocationBase", ctypes.c_void_p),
+        ("AllocationProtect", wintypes.DWORD),
+        ("PartitionId", wintypes.WORD),
+        ("RegionSize", ctypes.c_size_t),
+        ("State", wintypes.DWORD),
+        ("Protect", wintypes.DWORD),
+        ("Type", wintypes.DWORD),
+    ]
+
+
+kernel32.VirtualQueryEx.restype = ctypes.c_size_t
+kernel32.VirtualQueryEx.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_void_p,
+    ctypes.POINTER(MEMORY_BASIC_INFORMATION),
+    ctypes.c_size_t,
+]
+
+
+def list_readable_regions(process_handle: wintypes.HANDLE, max_regions: int = 20000, private_only: bool = False):
+    """Regiones de memoria comprometidas y legibles del proceso.
+
+    Con private_only=True se devuelven solo regiones privadas (heap/datos del
+    proceso, no imagenes mapeadas): donde viven las tablas RC4.
+    """
+    regions = []
+    address = 0
+    info = MEMORY_BASIC_INFORMATION()
+    while len(regions) < max_regions:
+        result = kernel32.VirtualQueryEx(
+            process_handle, ctypes.c_void_p(address), ctypes.byref(info), ctypes.sizeof(info)
+        )
+        if result == 0:
+            break
+        start = info.BaseAddress or 0
+        size = int(info.RegionSize)
+        if (
+            info.State == MEM_COMMIT
+            and info.Protect in _READABLE_PROTECTS
+            and size > 0
+            and not (private_only and info.Type != MEM_PRIVATE)
+        ):
+            regions.append((start, min(size, 32 * 1024 * 1024)))
+        address = start + size
+        if address <= start:
+            break
+    return regions
+
+
+def scan_process_permutations(
+    process,
+    region_limit: int = 20000,
+    max_bytes: int = 256 * 1024 * 1024,
+    progress=None,
+    pass_start: int = 0,
+    pass_count: int = 1,
+):
+    """Busca tablas RC4 (256 bytes permutacion de 0..255) en la memoria.
+
+    Escanea solo regiones privadas, en pasadas alineadas a 4 bytes (las tablas
+    estan alineadas por el asignador). `pass_start`/`pass_count` eligen que
+    residuos modulo 4 se examinan (las 4 pasadas cubren toda la memoria).
+    `progress(bytes_escaneados)` se llama periodicamente.
+
+    Devuelve [(direccion, sbox_bytes)].
+    """
+    from .crypto import is_permutation
+
+    handle = open_process(process.pid)
+    if not handle:
+        raise RuntimeError(f"No se pudo abrir el proceso {process.pid}")
+    try:
+        candidates = []
+        regions = list_readable_regions(handle, region_limit, private_only=True)
+        for pass_offset in range(pass_start, pass_start + pass_count):
+            scanned = 0
+            for start, size in regions:
+                if scanned >= max_bytes:
+                    break
+                chunk = read_process_memory(handle, start, size)
+                if not chunk:
+                    continue
+                scanned += len(chunk)
+                if progress is not None:
+                    progress(scanned)
+                for index in range(pass_offset, len(chunk) - 255, 4):
+                    window = chunk[index:index + 256]
+                    if is_permutation(window):
+                        candidates.append((start + index, bytes(window)))
+                        if len(candidates) >= 300:
+                            return candidates
+        return candidates
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def read_nearby_bytes(handle: wintypes.HANDLE, address: int, radius: int = 64) -> bytes:
+    """Lee `radius` bytes alrededor de una direccion (para localizar i y j)."""
+    chunk = read_process_memory(handle, address - radius, radius * 2 + 256)
+    return bytes(chunk) if chunk else b""
+
+
+def scan_process_for_bytes(process, needle: bytes, limit: int = 1000):
+    """Busca una secuencia de bytes en la memoria del proceso."""
+    handle = open_process(process.pid)
+    if not handle:
+        raise RuntimeError(f"No se pudo abrir el proceso {process.pid}")
+    try:
+        found = []
+        for start, size in list_readable_regions(handle):
+            chunk = read_process_memory(handle, start, size)
+            if not chunk:
+                continue
+            pos = chunk.find(needle)
+            while pos != -1 and len(found) < limit:
+                found.append(start + pos)
+                pos = chunk.find(needle, pos + 1)
+        return found
+    finally:
+        kernel32.CloseHandle(handle)

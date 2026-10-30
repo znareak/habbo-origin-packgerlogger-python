@@ -258,4 +258,96 @@ try:
 except ImportError:
     print("binary fallback OK (sin scapy, omitido)")
 
+# 10. Criptografia desde cero: MD5 + RC4
+from app.crypto import RC4State, is_permutation, md5
+
+assert md5(b"").hex() == "d41d8cd98f00b204e9800998ecf8427e"
+assert md5(b"abc").hex() == "900150983cd24fb0d6963f7d28e17f72"
+state = RC4State.from_key(b"Key")
+assert state.crypt(b"Plaintext") == bytes.fromhex("BBF316E8D940AF0AD3")
+plain = bytes(range(32)) * 3
+key_state = RC4State.from_key(b"Key")
+cipher = key_state.crypt(plain)
+restored = RC4State.from_key(b"Key")
+assert restored.crypt(cipher) == plain
+back = RC4State(list(key_state.sbox), key_state.i, key_state.j)
+assert back.crypt_backward(cipher[-16:]) == plain[-16:]
+assert is_permutation(bytes(range(256)))
+assert not is_permutation(bytes(256))
+
+# El descifrado RC4 de la direccion Send se integra en la captura
+import scapy.all as sp
+
+from app.capture import NpcapCaptureSource as _NpcapSource
+
+rc4_source = _NpcapSource(
+    connection={
+        "proto": "tcp",
+        "local_ip": "127.0.0.1",
+        "local_port": 1,
+        "remote_ip": "1.2.3.4",
+        "remote_port": 30000,
+    }
+)
+rc4_source.info = dict(rc4_source.connection)
+rc4_source.binary_decode = True
+rc4_source.set_rc4_state(RC4State.from_key(b"K"))
+rc4_emitted = []
+rc4_source.emit = rc4_emitted.append
+# Ciframos un mensaje con framing y lo enviamos como salida: debe decodificarse
+sender = RC4State.from_key(b"K")
+framed_send = (6).to_bytes(4, "big") + (2430).to_bytes(2, "big") + (2).to_bytes(4, "big")
+encrypted_send = sender.crypt(framed_send)
+send_packet = sp.Ether() / sp.IP() / sp.TCP(sport=1234, dport=1, flags="PA") / sp.Raw(load=encrypted_send)
+rc4_source._on_packet(send_packet)
+assert rc4_emitted and rc4_emitted[0].data == "Outgoing [2430] i:2", rc4_emitted
+print("crypto OK")
+
+# 11. Resincronizacion: los bytes descartados se muestran (hex o XOR legible)
+#     y el flujo se re-sincroniza con el siguiente mensaje valido.
+from app.capture import NpcapCaptureSource as _ResyncSource
+from app.capture import _format_unframed_payload
+
+source_resync = _ResyncSource(
+    connection={
+        "proto": "tcp",
+        "local_ip": "127.0.0.1",
+        "local_port": 1,
+        "remote_ip": "1.2.3.4",
+        "remote_port": 30000,
+    }
+)
+source_resync.info = dict(source_resync.connection)
+source_resync.binary_decode = True
+source_resync._binary_framed["Recv"] = True
+resync_emitted = []
+source_resync.emit = resync_emitted.append
+framed_ok = (6).to_bytes(4, "big") + (2430).to_bytes(2, "big") + (2).to_bytes(4, "big")
+garbage = b"\x01\x02\x03"
+resync_packet = (
+    sp.Ether() / sp.IP() / sp.TCP(sport=30000, dport=1, flags="PA") / sp.Raw(load=garbage + framed_ok)
+)
+source_resync._on_packet(resync_packet)
+assert len(resync_emitted) == 2, resync_emitted
+assert resync_emitted[0].data == _format_unframed_payload(garbage), resync_emitted
+assert resync_emitted[1].data == "Incoming [2430] i:2", resync_emitted
+print("resync OK")
+
+# 12. Alineamiento del estado RC4: el estado en memoria va ADELANTADO por los
+#     bytes que el cliente envio entre la ultima captura y la lectura.
+from app.capture import _find_alignment
+
+align_key = RC4State.from_key(b"K")
+align_frames = framed_ok * 3
+align_cipher = align_key.crypt(align_frames)
+snapshot = align_key.copy()
+snapshot.crypt(b"\x00\x00\x00\x00\x00")  # 5 bytes extra despues del final
+# El estado va 35 pasos por delante del inicio del flujo (30 + 5)
+shift, score = _find_alignment(
+    list(snapshot.sbox), snapshot.i, snapshot.j, align_cipher
+)
+assert score == 3 and shift == 35, (shift, score)
+assert _find_alignment(list(snapshot.sbox), 1, 2, align_cipher) == (None, 0)
+print("align OK")
+
 print("TODAS LAS PRUEBAS OK")

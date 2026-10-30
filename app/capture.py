@@ -36,6 +36,68 @@ def decode_payload(payload: bytes) -> str:
     return payload.hex(" ")
 
 
+def _find_alignment(sbox, i_value: int, j_value: int, tail: bytes, max_shift: int = 192):
+    """Busca cuantos bytes hay que retroceder el estado para alinearlo con `tail`.
+
+    Entre la ultima captura y la lectura de memoria el cliente envia mas bytes,
+    por lo que el estado RC4 en memoria va adelantado. Devuelve (shift, score)
+    del mejor alineamiento, o (None, 0) si ninguno produce framing valido.
+    """
+    from .crypto import RC4State
+
+    best = (None, 0)
+    for first_stage in (True, False):
+        low, high = (0, 64) if first_stage else (64, max_shift + 1)
+        hit = False
+        for shift in range(low, high):
+            state = RC4State(list(sbox), i_value, j_value)
+            for _ in range(shift):
+                state.step_back()
+            head = state.crypt(tail[:8])
+            length = int.from_bytes(head[:4], "big")
+            if not 2 <= length <= BINARY_MAX_MESSAGE_LENGTH:
+                continue
+            hit = True
+            state = RC4State(list(sbox), i_value, j_value)
+            for _ in range(shift):
+                state.step_back()
+            score = _frame_score(state.crypt(tail))
+            if score > best[1]:
+                best = (shift, score)
+            break
+        if hit:
+            break
+    return best
+
+
+def _verify_rc4_candidates(candidates, handle, tail: bytes, current_best):
+    """Prueba cada tabla candidata con los valores i/j de su vecindario.
+
+    Devuelve la mejor tupla (score, (sbox, i, j, direccion)) encontrada.
+    """
+    from .crypto import RC4State
+    from .processio import read_nearby_bytes
+
+    best = current_best
+    for address, sbox in candidates:
+        nearby = read_nearby_bytes(handle, address, 64)
+        values = []
+        # Los campos i/j suelen estar pegados a la tabla (antes o despues)
+        for value in list(nearby[48:64]) + list(nearby[320:336]) + list(nearby):
+            if value not in values:
+                values.append(value)
+            if len(values) >= 12:
+                break
+        for i_value in values:
+            for j_value in values:
+                _shift, score = _find_alignment(sbox, i_value, j_value, tail)
+                if score > best[0]:
+                    best = (score, (list(sbox), i_value, j_value, address))
+                if best[0] >= 4:
+                    return best
+    return best
+
+
 class NpcapCaptureSource:
     """Fuente de paquetes que olfatea el trafico TCP/UDP de un proceso.
 
@@ -61,6 +123,12 @@ class NpcapCaptureSource:
         self.binary_decode = False
         # Mostrar los mensajes decodificados en el formato legacy de bytes (G-Earth)
         self.legacy_format = False
+        # Descifrado RC4 de la direccion Send (estado localizado en la memoria
+        # del proceso; ver find_rc4_state).
+        self.rc4_state = None
+        self.rc4_raw = bytearray()   # ultima salida Send cifrada capturada
+        self.rc4_raw_limit = 256 * 1024
+        self.rc4_process = process
         self._binary_streams = {"Send": bytearray(), "Recv": bytearray()}
         self._binary_framed = {"Send": False, "Recv": False}
 
@@ -140,10 +208,7 @@ class NpcapCaptureSource:
             sport = raw_packet[TCP].sport
         elif UDP in raw_packet:
             sport = raw_packet[UDP].sport
-        if sport is None or Raw not in raw_packet:
-            return
-        payload = bytes(raw_packet[Raw].load)
-        if not payload:
+        if sport is None:
             return
 
         remote_port = self.info.get("remote_port")
@@ -154,9 +219,42 @@ class NpcapCaptureSource:
             local_port = self.info.get("local_port")
             direction = "Send" if sport == local_port else "Recv"
 
+        # Nueva conexion TCP (SYN): reinicia el reensamblado de ambas
+        # direcciones (el juego reconecta y la cola vieja desincronizaria).
+        if TCP in raw_packet and raw_packet[TCP].flags & 0x02:
+            self._binary_streams["Send"].clear()
+            self._binary_streams["Recv"].clear()
+            self._binary_framed["Send"] = False
+            self._binary_framed["Recv"] = False
+            if self.rc4_state is not None:
+                self.rc4_state = None
+                self.rc4_raw.clear()
+
+        if Raw not in raw_packet:
+            return
+        payload = bytes(raw_packet[Raw].load)
+        if not payload:
+            return
+
+        if self.rc4_state is not None and direction == "Send":
+            payload = self.rc4_state.crypt(payload)
+        elif direction == "Send":
+            self.rc4_raw.extend(payload)
+            overflow = len(self.rc4_raw) - self.rc4_raw_limit
+            if overflow > 0:
+                del self.rc4_raw[:overflow]
+
         if self.binary_decode and self.info.get("proto", "tcp") == "tcp":
             stream = self._binary_streams[direction]
             stream.extend(payload)
+            # Cola descontrolada: volcar como hex y empezar de cero
+            if len(stream) > BINARY_MAX_MESSAGE_LENGTH:
+                self._emit_packet(
+                    direction, _format_unframed_payload(bytes(stream))
+                )
+                stream.clear()
+                self._binary_framed[direction] = False
+                return
             # Si esta direccion nunca produjo un mensaje con framing y la
             # cabecera no parece una longitud valida, tratarla como flujo
             # sin framing y mostrar el payload crudo en hex.
@@ -170,7 +268,11 @@ class NpcapCaptureSource:
                     return
             # Extraer todos los mensajes con framing disponibles
             while True:
-                frames = extract_binary_frames(stream)
+                frames, dropped = extract_binary_frames_resync(stream)
+                if dropped:
+                    # Bytes descartados por desincronizacion: mostrarlos en hex
+                    # en vez de perderlos en silencio.
+                    self._emit_packet(direction, _format_unframed_payload(dropped))
                 if not frames:
                     break
                 self._binary_framed[direction] = True
@@ -224,6 +326,87 @@ class NpcapCaptureSource:
                 f"{self.info.get('remote_port') or self.info.get('local_port', '?')}"
             )
         return "captura Npcap (sin conexion)"
+
+    def set_rc4_state(self, state) -> None:
+        """Aplica el estado RC4 encontrado y limpia el flujo Send anterior."""
+        self.rc4_state = state
+        self._binary_streams["Send"].clear()
+        self._binary_framed["Send"] = False
+        self.rc4_raw.clear()
+
+    def find_rc4_state(self, process=None, progress=None) -> str:
+        """Busca la tabla RC4 en la memoria del proceso y la verifica contra
+        la salida Send capturada. Aplica el estado si la verificacion cuadra.
+
+        `progress(mensaje)` se llama periodicamente con texto de estado.
+        Devuelve un mensaje con el resultado; lanza RuntimeError si falla.
+        """
+        from .crypto import RC4State
+        from .processio import (
+            kernel32, open_process, read_nearby_bytes, scan_process_permutations,
+        )
+
+        target = process or self.rc4_process
+        if target is None:
+            raise RuntimeError(
+                "La captura no tiene proceso asociado (abrela con el proceso "
+                "seleccionado en el dialogo de captura)."
+            )
+        raw = bytes(self.rc4_raw)
+        if len(raw) < 12:
+            raise RuntimeError(
+                "Aun hay poca salida Send capturada para verificar: espera a "
+                "que el cliente envie paquetes y reintenta."
+            )
+        if progress is not None:
+            progress("Escaneando la memoria del proceso (tablas RC4)...")
+        handle = open_process(target.pid)
+        if not handle:
+            raise RuntimeError(f"No se pudo abrir el proceso {target.pid}.")
+        best = (0, None)  # (puntuacion, (sbox, i, j, direccion))
+        tail = raw[-2048:]
+        all_candidates = {}
+        try:
+            for pass_index in range(4):
+                if progress is not None:
+                    progress(f"Escaneando memoria (pasada {pass_index + 1}/4)...")
+                found = scan_process_permutations(
+                    target,
+                    pass_start=pass_index,
+                    pass_count=1,
+                    max_bytes=256 * 1024 * 1024,
+                    progress=lambda scanned: (
+                        progress(f"Escaneando memoria... {scanned // (1024 * 1024)} MB")
+                        if progress is not None else None
+                    ),
+                )
+                for address, sbox in found:
+                    all_candidates.setdefault(address, sbox)
+                if progress is not None:
+                    progress(
+                        f"Verificando {len(all_candidates)} tablas candidatas "
+                        "contra la salida Send..."
+                    )
+                best = _verify_rc4_candidates(
+                    list(all_candidates.items()), handle, tail, best
+                )
+                if best[0] >= 2:
+                    break
+        finally:
+            kernel32.CloseHandle(handle)
+        if best[0] < 1 or best[1] is None:
+            raise RuntimeError(
+                f"Se hallaron {len(all_candidates)} tablas RC4 pero ninguna "
+                f"descifro la salida Send (mejor puntuacion {best[0]}). "
+                "El juego puede re-inicializar el cifrado por paquete o "
+                "proteger la memoria."
+            )
+        sbox, i_value, j_value, address = best[1]
+        self.set_rc4_state(RC4State(sbox, i_value, j_value))
+        return (
+            f"Estado RC4 aplicado desde 0x{address:X} (i={i_value}, j={j_value}, "
+            f"{best[0]} mensajes validos). La salida Send se descifra desde ahora."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -292,19 +475,35 @@ def save_packet_schema(header: int, name: str, fields: List[str]) -> dict:
         json.dump(data, file, indent=2, ensure_ascii=False)
     return entry
 
-def extract_binary_frames(buffer: bytearray):
-    """Extrae mensajes completos de un buffer TCP y los consume.
+def _frame_score(data: bytes) -> int:
+    """Cuantos mensajes con framing valido consecutivos hay en `data`."""
+    index = 0
+    score = 0
+    while index + 6 <= len(data):
+        length = int.from_bytes(data[index:index + 4], "big")
+        if not 2 <= length <= BINARY_MAX_MESSAGE_LENGTH:
+            break
+        if index + 4 + length > len(data):
+            break
+        score += 1
+        index += 4 + length
+    return score
 
-    Devuelve una lista de (header, body). Los bytes incompletos quedan en el
-    buffer a la espera de mas datos. Si el flujo se desincroniza (longitud
-    absurda) descarta bytes de uno en uno hasta volver a sincronizar.
+
+def extract_binary_frames_resync(buffer: bytearray):
+    """Como extract_binary_frames, pero devuelve tambien los bytes descartados.
+
+    Devuelve (frames, dropped): `dropped` son los bytes eliminados por
+    desincronizacion (longitud absurda), para poder mostrarlos en hex.
     """
     frames = []
+    dropped = bytearray()
     while True:
         if len(buffer) < 4:
             break
         length = int.from_bytes(buffer[0:4], "big")
         if length < 2 or length > BINARY_MAX_MESSAGE_LENGTH:
+            dropped.append(buffer[0])
             del buffer[0]
             continue
         if len(buffer) < 4 + length:
@@ -313,6 +512,17 @@ def extract_binary_frames(buffer: bytearray):
         body = bytes(buffer[6:4 + length])
         del buffer[0:4 + length]
         frames.append((header, body))
+    return frames, bytes(dropped)
+
+
+def extract_binary_frames(buffer: bytearray):
+    """Extrae mensajes completos de un buffer TCP y los consume.
+
+    Devuelve una lista de (header, body). Los bytes incompletos quedan en el
+    buffer a la espera de mas datos. Si el flujo se desincroniza (longitud
+    absurda) descarta bytes de uno en uno hasta volver a sincronizar.
+    """
+    frames, _dropped = extract_binary_frames_resync(buffer)
     return frames
 
 

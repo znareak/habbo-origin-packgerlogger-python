@@ -486,6 +486,8 @@ class SourceTab(ttk.Frame):
             ttk.Checkbutton(
                 toolbar, text="Bytes (G-Earth)", variable=self.legacy_var, command=self._toggle_legacy
             ).pack(side="left")
+            if getattr(source, "rc4_process", None) is not None:
+                ttk.Button(toolbar, text="RC4 Send", command=self._find_rc4).pack(side="left", padx=4)
         self.status_var = tk.StringVar(value="Detenido")
         ttk.Label(toolbar, textvariable=self.status_var, foreground="#9a9a9a").pack(side="right")
 
@@ -608,6 +610,24 @@ class SourceTab(ttk.Frame):
                 if self.legacy_var.get()
                 else "Formato expresion activado"
             )
+
+    def _find_rc4(self) -> None:
+        """Busca el estado RC4 del proceso en memoria y lo aplica a los Send."""
+        if not isinstance(self.source, NpcapCaptureSource):
+            return
+        self.status_var.set("Buscando estado RC4 en la memoria del proceso...")
+
+        def worker():
+            try:
+                def progress(message: str) -> None:
+                    self.status_var.set(message)
+
+                message = self.source.find_rc4_state(progress=progress)
+                self.status_var.set(message)
+            except Exception as exc:
+                self._report_error(f"RC4: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # -- cola de paquetes ------------------------------------------------
 

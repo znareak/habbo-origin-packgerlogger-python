@@ -37,6 +37,18 @@ DEFAULT_SETTINGS: dict = {}
 
 MAX_ROWS = 10000
 
+# Paleta dark mode (grises con buen contraste, estilo VS Code dark)
+DARK_BG = "#1e1e1e"       # fondo general
+DARK_PANEL = "#252526"    # menus, cabeceras, pestañas no activas
+DARK_FIELD = "#2d2d2d"    # campos de texto y listas
+DARK_BUTTON = "#333333"   # botones
+DARK_HOVER = "#404040"    # resaltado al pasar el raton
+DARK_BORDER = "#3c3c3c"   # bordes
+DARK_FG = "#cccccc"       # texto principal
+DARK_FG_DIM = "#9a9a9a"   # texto secundario
+DARK_SELECT = "#264f78"   # seleccion
+DARK_TREE = "#1b1b1b"     # fondo de la tabla de paquetes (ligeramente mas oscuro)
+
 
 def load_settings() -> dict:
     settings = dict(DEFAULT_SETTINGS)
@@ -54,6 +66,20 @@ def save_settings(settings: dict) -> None:
             json.dump(settings, handle, indent=2, ensure_ascii=False)
     except OSError:
         pass
+
+
+def pick_mono_font(root, size: int = 9):
+    """Devuelve (familia, tamano) con una tipografia de consola instalada."""
+    try:
+        import tkinter.font as tkfont
+
+        families = {name.lower() for name in tkfont.families(root)}
+    except Exception:
+        families = set()
+    for family in ("Consolas", "Lucida Console", "Source Code Pro"):
+        if family.lower() in families:
+            return (family, size)
+    return ("Consolas", size)
 
 
 def center_window(window: tk.Toplevel) -> None:
@@ -80,9 +106,37 @@ class PacketGrid(ttk.Frame):
     (la tabla puede recortarlo visualmente) y opciones de copiado.
     """
 
-    def __init__(self, master, on_select=None):
+    def __init__(self, master, on_select=None, on_send_packet=None):
         super().__init__(master)
         self.columns = ("time", "dir", "data")
+        self._on_send_packet = on_send_packet
+        # Tema oscuro para la lista de paquetes (estilo consola)
+        mono_font = pick_mono_font(self)
+        style = ttk.Style(self)
+        style.configure(
+            "Treeview",
+            background=DARK_TREE,
+            fieldbackground=DARK_TREE,
+            foreground=DARK_FG,
+            font=mono_font,
+            rowheight=26,
+            relief="flat",
+            borderwidth=0,
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", DARK_SELECT)],
+            foreground=[("selected", "#ffffff")],
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=DARK_PANEL,
+            foreground=DARK_FG,
+            font=mono_font,
+            relief="flat",
+            borderwidth=0,
+        )
+        style.map("Treeview.Heading", background=[("active", DARK_HOVER)])
         self.tree = ttk.Treeview(self, columns=self.columns, show="headings", selectmode="browse")
         self.tree.heading("time", text="Tiempo")
         self.tree.heading("dir", text="Dir")
@@ -90,8 +144,8 @@ class PacketGrid(ttk.Frame):
         self.tree.column("time", width=80, stretch=False, anchor="center")
         self.tree.column("dir", width=55, stretch=False, anchor="center")
         self.tree.column("data", width=400, stretch=True)
-        self.tree.tag_configure("Send", foreground="#1a6fff")
-        self.tree.tag_configure("Recv", foreground="#0a8f3c")
+        self.tree.tag_configure("Send", foreground="#569cd6")
+        self.tree.tag_configure("Recv", foreground="#6a9955")
 
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
@@ -119,9 +173,15 @@ class PacketGrid(ttk.Frame):
             height=4,
             wrap="word",
             state="disabled",
-            background="#f5f5f5",
-            relief="solid",
-            borderwidth=1,
+            background=DARK_TREE,
+            foreground=DARK_FG,
+            insertbackground="#ffffff",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_BORDER,
+            font=pick_mono_font(self),
         )
         detail_vsb = ttk.Scrollbar(detail_frame, orient="vertical", command=self.detail_text.yview)
         self.detail_text.configure(yscrollcommand=detail_vsb.set)
@@ -129,9 +189,15 @@ class PacketGrid(ttk.Frame):
         detail_vsb.grid(row=1, column=1, sticky="ns")
 
         # Menu contextual y atajo de teclado
-        self._menu = tk.Menu(self, tearoff=0)
+        self._menu = tk.Menu(
+            self, tearoff=0, bg=DARK_PANEL, fg=DARK_FG,
+            activebackground=DARK_HOVER, activeforeground="#ffffff",
+        )
         self._menu.add_command(label="Copiar paquete", command=self.copy_packet)
         self._menu.add_command(label="Copiar linea completa", command=self.copy_line)
+        if self._on_send_packet is not None:
+            self._menu.add_separator()
+            self._menu.add_command(label="Enviar paquete", command=self._send_selected)
         self._menu.add_separator()
         self._menu.add_command(label="Limpiar pantalla", command=self.clear)
         self.tree.bind("<Button-3>", self._on_right_click)
@@ -140,6 +206,12 @@ class PacketGrid(ttk.Frame):
 
         self._on_select = on_select
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+    def _send_selected(self) -> None:
+        """Envia el paquete seleccionado con su direccion original."""
+        packet = self.selected()
+        if packet is not None and self._on_send_packet is not None:
+            self._on_send_packet(packet)
 
     def _on_tree_select(self, _event=None) -> None:
         packet = self.selected()
@@ -249,6 +321,12 @@ class FilterBar(ttk.Frame):
         ttk.Label(self, text="Contiene:").pack(side="left", padx=(8, 2))
         self.contains_var = tk.StringVar()
         ttk.Entry(self, textvariable=self.contains_var, width=12).pack(side="left", padx=2)
+
+        self.suppress_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self, text="Suprimir (ocultar coincidencias)", variable=self.suppress_var,
+            command=self._changed,
+        ).pack(side="left", padx=(8, 2))
 
         ttk.Button(self, text="Aplicar", command=self._changed).pack(side="left", padx=(8, 2))
 
@@ -370,12 +448,12 @@ class SourceTab(ttk.Frame):
                 toolbar, text="Habbo", variable=self.habbo_var, command=self._toggle_habbo
             ).pack(side="left", padx=4)
         self.status_var = tk.StringVar(value="Detenido")
-        ttk.Label(toolbar, textvariable=self.status_var, foreground="#555").pack(side="right")
+        ttk.Label(toolbar, textvariable=self.status_var, foreground="#9a9a9a").pack(side="right")
 
         self.filter_bar = FilterBar(self, profile_store, on_change=self._apply_filter)
         self.filter_bar.pack(fill="x", padx=4, pady=2)
 
-        self.grid = PacketGrid(self)
+        self.grid = PacketGrid(self, on_send_packet=self._send_packet_from_grid)
         self.grid.pack(fill="both", expand=True, padx=4, pady=2)
 
         self.send_panel = SendPanel(self, on_send=self._send, injectors_provider=self._injector_options)
@@ -391,21 +469,27 @@ class SourceTab(ttk.Frame):
 
     # -- filtros ---------------------------------------------------------
 
-    def _apply_filter(self) -> None:
+    def _filter_match(self, packet: Packet) -> bool:
+        """Devuelve True si el paquete debe mostrarse con el filtro actual.
+
+        Con el modo "Suprimir" activado se ocultan las coincidencias en lugar
+        de mostrarlas (la captura es pasiva: no se pueden bloquear paquetes
+        reales, solo ocultarlos de la lista).
+        """
         profile = self.app.profile_store.get(self.filter_bar.selected_profile())
         quick = self.filter_bar.quick_filter()
+        matched = (profile is None or profile.matches(packet)) and quick.matches(packet)
+        if self.filter_bar.suppress_var.get():
+            return not matched
+        return matched
 
-        def keep(packet: Packet) -> bool:
-            if profile is not None and not profile.matches(packet):
-                return False
-            return quick.matches(packet)
-
+    def _apply_filter(self) -> None:
         # Re-inserta todo con el filtro actual
         self.grid.clear()
         source_packets = getattr(self.source, "packets", None)
         if source_packets is not None:
             for packet in source_packets:
-                if keep(packet):
+                if self._filter_match(packet):
                     self.grid.add(packet, autoscroll=False)
 
     # -- fuente ----------------------------------------------------------
@@ -489,11 +573,7 @@ class SourceTab(ttk.Frame):
             pass
 
     def _add_packet(self, packet: Packet) -> None:
-        profile = self.app.profile_store.get(self.filter_bar.selected_profile())
-        quick = self.filter_bar.quick_filter()
-        if profile is not None and not profile.matches(packet):
-            return
-        if not quick.matches(packet):
+        if not self._filter_match(packet):
             return
         self.grid.add(packet, autoscroll=self.autoscroll_var.get())
 
@@ -538,6 +618,10 @@ class SourceTab(ttk.Frame):
                     self.status_var.set(f"Error al enviar: {exc}")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _send_packet_from_grid(self, packet: Packet) -> None:
+        """Envia el paquete seleccionado en la tabla con su direccion original."""
+        self._send(packet.direction, packet.data)
 
     def _toggle_periodic(self) -> None:
         if self.send_panel._periodic_active:
@@ -638,7 +722,10 @@ class NotebookPane(ttk.Frame):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
         self.notebook.bind("<Button-3>", self._on_right_click)
-        self._menu = tk.Menu(self, tearoff=0)
+        self._menu = tk.Menu(
+            self, tearoff=0, bg=DARK_PANEL, fg=DARK_FG,
+            activebackground=DARK_HOVER, activeforeground="#ffffff",
+        )
         self._menu.add_command(label="Flotar", command=self._float_tab)
         self._menu.add_command(label="Dividir / mover a otro panel", command=self._split_tab)
         self._menu.add_separator()
@@ -702,6 +789,7 @@ class FloatWindow(tk.Toplevel):
         super().__init__(app)
         self.app = app
         self.title("Packet Logger - flotante")
+        self.configure(bg=DARK_BG)
         x = max(0, (self.winfo_screenwidth() - 800) // 2)
         y = max(0, (self.winfo_screenheight() - 500) // 3)
         self.geometry(f"800x500+{x}+{y}")
@@ -724,6 +812,7 @@ class CaptureDialog(tk.Toplevel):
         super().__init__(master)
         self.title("Nueva captura Npcap")
         self.resizable(False, False)
+        self.configure(bg=DARK_BG)
         self.result: Optional[dict] = None
 
         body = ttk.Frame(self, padding=10)
@@ -748,7 +837,13 @@ class CaptureDialog(tk.Toplevel):
 
         # -- Conexiones --
         ttk.Label(body, text="Conexiones (ip:puerto):").grid(row=2, column=0, sticky="nw")
-        self.conn_list = tk.Listbox(body, height=6, width=52, exportselection=False)
+        self.conn_list = tk.Listbox(
+            body, height=6, width=52, exportselection=False,
+            bg=DARK_FIELD, fg=DARK_FG,
+            selectbackground=DARK_SELECT, selectforeground="#ffffff",
+            relief="flat", highlightthickness=1,
+            highlightbackground=DARK_BORDER, highlightcolor=DARK_BORDER,
+        )
         self.conn_list.grid(row=2, column=1, sticky="we")
         self.connections = []
 
@@ -871,6 +966,7 @@ class InjectorDialog(tk.Toplevel):
         super().__init__(master)
         self.title("Nuevo inyector")
         self.resizable(False, False)
+        self.configure(bg=DARK_BG)
         self.result: Optional[dict] = None
 
         body = ttk.Frame(self, padding=10)
@@ -892,7 +988,13 @@ class InjectorDialog(tk.Toplevel):
         self.search_var.trace_add("write", self._on_search)
 
         ttk.Label(body, text="Conexiones TCP (ip:puerto):").grid(row=2, column=0, sticky="nw")
-        self.conn_list = tk.Listbox(body, height=6, width=52, exportselection=False)
+        self.conn_list = tk.Listbox(
+            body, height=6, width=52, exportselection=False,
+            bg=DARK_FIELD, fg=DARK_FG,
+            selectbackground=DARK_SELECT, selectforeground="#ffffff",
+            relief="flat", highlightthickness=1,
+            highlightbackground=DARK_BORDER, highlightcolor=DARK_BORDER,
+        )
         self.conn_list.grid(row=2, column=1, sticky="we")
         self.connections = []
 
@@ -993,6 +1095,7 @@ class ProfileManager(tk.Toplevel):
         super().__init__(master)
         self.title("Gestor de perfiles de filtros")
         self.geometry("560x420")
+        self.configure(bg=DARK_BG)
         self.store = profile_store
 
         body = ttk.Frame(self, padding=8)
@@ -1001,7 +1104,12 @@ class ProfileManager(tk.Toplevel):
         left = ttk.Frame(body)
         left.pack(side="left", fill="y", padx=(0, 8))
         ttk.Label(left, text="Perfiles:").pack(anchor="w")
-        self.profile_list = tk.Listbox(left, width=22)
+        self.profile_list = tk.Listbox(
+            left, width=22, bg=DARK_FIELD, fg=DARK_FG,
+            selectbackground=DARK_SELECT, selectforeground="#ffffff",
+            relief="flat", highlightthickness=1,
+            highlightbackground=DARK_BORDER, highlightcolor=DARK_BORDER,
+        )
         self.profile_list.pack(fill="both", expand=True)
         self.profile_list.bind("<<ListboxSelect>>", self._on_profile_select)
         ttk.Button(left, text="Eliminar perfil", command=self._delete_profile).pack(fill="x", pady=2)
@@ -1013,7 +1121,12 @@ class ProfileManager(tk.Toplevel):
         ttk.Entry(right, textvariable=self.name_var).pack(fill="x")
 
         ttk.Label(right, text="Filtros del perfil (se cumple si alguno coincide):").pack(anchor="w", pady=(6, 0))
-        self.filter_list = tk.Listbox(right, height=8)
+        self.filter_list = tk.Listbox(
+            right, height=8, bg=DARK_FIELD, fg=DARK_FG,
+            selectbackground=DARK_SELECT, selectforeground="#ffffff",
+            relief="flat", highlightthickness=1,
+            highlightbackground=DARK_BORDER, highlightcolor=DARK_BORDER,
+        )
         self.filter_list.pack(fill="both", expand=True)
         self.filter_list.bind("<<ListboxSelect>>", self._on_filter_select)
 
@@ -1118,6 +1231,7 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
+        self._apply_dark_theme()
         self.title("Packet Logger")
         width, height = 1100, 650
         x = max(0, (self.winfo_screenwidth() - width) // 2)
@@ -1135,27 +1249,141 @@ class App(tk.Tk):
 
     # -- construccion -----------------------------------------------------
 
-    def _build_menu(self) -> None:
-        menubar = tk.Menu(self)
+    def _apply_dark_theme(self) -> None:
+        """Aplica un tema oscuro con buen contraste a toda la aplicacion."""
+        background = DARK_BG
+        self.configure(bg=background)
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure(".", background=background, foreground=DARK_FG)
+        style.configure("TFrame", background=background)
+        style.configure("TLabel", background=background, foreground=DARK_FG)
+        style.configure("TButton", background=DARK_BUTTON, foreground=DARK_FG)
+        style.configure(
+            "TButton",
+            bordercolor=DARK_BORDER,
+            lightcolor=DARK_BORDER,
+            darkcolor=DARK_BORDER,
+        )
+        style.map("TButton", background=[("active", DARK_HOVER)])
+        style.configure("TCheckbutton", background=background, foreground=DARK_FG)
+        style.configure(
+            "TCheckbutton",
+            indicatorbackground=DARK_FIELD,
+            indicatorforeground=DARK_FG,
+            lightcolor=DARK_BORDER,
+            darkcolor=DARK_BORDER,
+        )
+        style.map("TCheckbutton", background=[("active", background)])
+        style.configure("TRadiobutton", background=background, foreground=DARK_FG)
+        style.configure(
+            "TRadiobutton",
+            indicatorbackground=DARK_FIELD,
+            indicatorforeground=DARK_FG,
+            lightcolor=DARK_BORDER,
+            darkcolor=DARK_BORDER,
+        )
+        style.map("TRadiobutton", background=[("active", background)])
+        style.configure(
+            "TEntry", fieldbackground=DARK_FIELD, foreground=DARK_FG, insertcolor=DARK_FG
+        )
+        style.configure(
+            "TEntry",
+            bordercolor=DARK_BORDER,
+            lightcolor=DARK_BORDER,
+            darkcolor=DARK_BORDER,
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=DARK_FIELD,
+            background=DARK_BUTTON,
+            foreground=DARK_FG,
+            arrowcolor=DARK_FG,
+            bordercolor=DARK_BORDER,
+            lightcolor=DARK_BORDER,
+            darkcolor=DARK_BORDER,
+        )
+        style.map("TCombobox", fieldbackground=[("readonly", DARK_FIELD)])
+        style.configure(
+            "TSpinbox", fieldbackground=DARK_FIELD, background=DARK_BUTTON, foreground=DARK_FG
+        )
+        style.configure(
+            "TSpinbox",
+            bordercolor=DARK_BORDER,
+            lightcolor=DARK_BORDER,
+            darkcolor=DARK_BORDER,
+            arrowcolor=DARK_FG,
+        )
+        style.configure(
+            "TLabelframe", background=background, foreground=DARK_FG, bordercolor=DARK_BORDER
+        )
+        style.configure("TLabelframe.Label", background=background, foreground=DARK_FG)
+        style.configure("TNotebook", background=background, borderwidth=0)
+        style.configure(
+            "TNotebook",
+            bordercolor=DARK_BORDER,
+            lightcolor=DARK_BORDER,
+            darkcolor=DARK_BORDER,
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background=DARK_PANEL,
+            foreground=DARK_FG,
+            bordercolor=DARK_BORDER,
+            lightcolor=DARK_BORDER,
+            darkcolor=DARK_BORDER,
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", background)],
+            lightcolor=[("selected", DARK_BORDER)],
+            darkcolor=[("selected", DARK_BORDER)],
+        )
+        style.configure("TPanedwindow", background=background, sashwidth=4, sashrelief="flat")
+        style.configure(
+            "Treeview", background=DARK_TREE, fieldbackground=DARK_TREE,
+            relief="flat", borderwidth=0,
+        )
+        style.configure(
+            "Vertical.TScrollbar", background=DARK_BUTTON, troughcolor=background,
+            bordercolor=DARK_BORDER, arrowcolor=DARK_FG,
+            lightcolor=DARK_BORDER, darkcolor=DARK_BORDER,
+        )
+        style.map("Vertical.TScrollbar", background=[("active", DARK_HOVER)])
+        style.configure(
+            "Horizontal.TScrollbar", background=DARK_BUTTON, troughcolor=background,
+            bordercolor=DARK_BORDER, arrowcolor=DARK_FG,
+            lightcolor=DARK_BORDER, darkcolor=DARK_BORDER,
+        )
+        style.map("Horizontal.TScrollbar", background=[("active", DARK_HOVER)])
 
-        sources_menu = tk.Menu(menubar, tearoff=0)
+    def _build_menu(self) -> None:
+        menu_colors = {
+            "bg": DARK_PANEL,
+            "fg": DARK_FG,
+            "activebackground": DARK_HOVER,
+            "activeforeground": "#ffffff",
+        }
+        menubar = tk.Menu(self, **menu_colors)
+
+        sources_menu = tk.Menu(menubar, tearoff=0, **menu_colors)
         sources_menu.add_command(label="Captura Npcap (cualquier proceso)...", command=self._add_capture)
         sources_menu.add_command(label="Archivo de paquetes...", command=self._add_file)
         sources_menu.add_separator()
         sources_menu.add_command(label="Cerrar pestaña activa", command=self._close_active_tab)
         menubar.add_cascade(label="Fuentes", menu=sources_menu)
 
-        injector_menu = tk.Menu(menubar, tearoff=0)
+        injector_menu = tk.Menu(menubar, tearoff=0, **menu_colors)
         injector_menu.add_command(label="Nuevo inyector...", command=self._add_injector)
         injector_menu.add_command(label="Cerrar todos los inyectores", command=self._close_injectors)
         menubar.add_cascade(label="Inyectores", menu=injector_menu)
 
-        profiles_menu = tk.Menu(menubar, tearoff=0)
+        profiles_menu = tk.Menu(menubar, tearoff=0, **menu_colors)
         profiles_menu.add_command(label="Gestor de perfiles de filtros...", command=self._open_profiles)
         profiles_menu.add_command(label="Recargar perfiles", command=self._reload_profiles)
         menubar.add_cascade(label="Perfiles", menu=profiles_menu)
 
-        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu = tk.Menu(menubar, tearoff=0, **menu_colors)
         help_menu.add_command(label="Acerca de", command=self._about)
         menubar.add_cascade(label="Ayuda", menu=help_menu)
 

@@ -65,6 +65,25 @@ class SYSTEM_HANDLE_INFORMATION(ctypes.Structure):
     ]
 
 
+class PROCESS_HANDLE_TABLE_ENTRY_INFO(ctypes.Structure):
+    _fields_ = [
+        ("HandleValue", ctypes.c_void_p),
+        ("HandleCount", ctypes.c_size_t),
+        ("PointerCount", ctypes.c_size_t),
+        ("GrantedAccess", ctypes.c_ulong),
+        ("ObjectTypeIndex", ctypes.c_ulong),
+        ("HandleAttributes", ctypes.c_ulong),
+        ("Reserved", ctypes.c_ulong),
+    ]
+
+
+class PROCESS_HANDLE_SNAPSHOT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("NumberOfHandles", ctypes.c_size_t),
+        ("Handles", PROCESS_HANDLE_TABLE_ENTRY_INFO * 1),
+    ]
+
+
 def _errcheck_handle(result, _func, _args):
     if not result:
         raise ctypes.WinError(ctypes.get_last_error())
@@ -108,6 +127,17 @@ ntdll.NtQuerySystemInformation.argtypes = [
     wintypes.ULONG,
     ctypes.POINTER(wintypes.ULONG),
 ]
+
+# NtQueryInformationProcess(ProcessHandleInformation = 51)
+ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+ntdll.NtQueryInformationProcess.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_long,
+    ctypes.c_void_p,
+    wintypes.ULONG,
+    ctypes.POINTER(wintypes.ULONG),
+]
+PROCESS_HANDLE_INFORMATION_CLASS = 51
 
 ws2_32.getsockopt.restype = ctypes.c_int
 ws2_32.getsockopt.argtypes = [
@@ -185,6 +215,34 @@ def find_process_connections(proc: psutil.Process) -> List[dict]:
     return find_tcp_connections(proc, None) + find_udp_endpoints(proc)
 
 
+# Puertos tipicos de servidores de juegos online (Habbo y similares):
+# 30000-30199 = puerto de juego, 20000-20099 = lobby/auth.
+GAME_PORT_RANGES = ((30000, 30199), (20000, 20099))
+
+
+def score_tcp_connection(connection: dict) -> int:
+    """Puntuacion heuristica: cuanto mas alta, mas probable es la conexion de juego."""
+    port = connection.get("remote_port", 0)
+    score = 0
+    if 30000 <= port <= 30199:
+        score += 20
+    elif 20000 <= port <= 20099:
+        score += 10
+    elif port not in (80, 443, 53, 8080, 8443):
+        score += 5
+    return score
+
+
+def best_tcp_connection(connections: List[dict]) -> Optional[dict]:
+    """Devuelve la conexion TCP mas probable para capturar/inyectar."""
+    if not connections:
+        return None
+    return max(
+        connections,
+        key=lambda c: (score_tcp_connection(c), c.get("remote_port", 0)),
+    )
+
+
 def list_all_processes() -> List[psutil.Process]:
     """Devuelve todos los procesos con pid y nombre, ordenados por nombre."""
     found: List[psutil.Process] = []
@@ -213,8 +271,40 @@ def open_process(pid: int) -> wintypes.HANDLE:
     )
 
 
-def enumerate_handles(pid: int) -> List[int]:
-    """Enumeracion de handles del proceso via NtQuerySystemInformation."""
+def enumerate_process_handles(process_handle: wintypes.HANDLE) -> List[int]:
+    """Enumeracion de handles del proceso objetivo via NtQueryInformationProcess.
+
+    Mas fiable que la enumeracion global (funciona con PIDs grandes y requiere
+    menos privilegios).
+    """
+    length = wintypes.ULONG(0x10000)
+    needed = wintypes.ULONG(0)
+    for _ in range(10):
+        buffer = ctypes.create_string_buffer(length.value)
+        status = ntdll.NtQueryInformationProcess(
+            process_handle,
+            PROCESS_HANDLE_INFORMATION_CLASS,
+            buffer,
+            length,
+            ctypes.byref(needed),
+        )
+        if status == STATUS_INFO_LENGTH_MISMATCH:
+            length.value = max(needed.value * 2, length.value * 2)
+            continue
+        if status != 0:
+            return []
+        snapshot = ctypes.cast(buffer, ctypes.POINTER(PROCESS_HANDLE_SNAPSHOT_INFORMATION))
+        count = snapshot.contents.NumberOfHandles
+        entries = ctypes.cast(
+            ctypes.addressof(snapshot.contents.Handles),
+            ctypes.POINTER(PROCESS_HANDLE_TABLE_ENTRY_INFO * count),
+        )
+        return [entry.HandleValue for entry in entries.contents]
+    return []
+
+
+def enumerate_system_handles(pid: int) -> List[int]:
+    """Respaldo: enumeracion global de handles via NtQuerySystemInformation."""
     length = wintypes.ULONG(0x100000)  # 1 MB inicial
     needed = wintypes.ULONG(0)
     for _ in range(10):
@@ -353,11 +443,14 @@ class SocketInjector:
                 f"El proceso {self.pid} no tiene conexiones TCP establecidas."
             )
 
-        chosen = connections[0]
+        chosen = best_tcp_connection(connections)
         target_remote = (chosen["remote_ip"], chosen["remote_port"])
 
         checked = 0
-        for handle_value in enumerate_handles(self.pid):
+        handle_values = enumerate_process_handles(self.process_handle)
+        if not handle_values:
+            handle_values = enumerate_system_handles(self.pid)
+        for handle_value in handle_values:
             duplicated = duplicate_handle(self.process_handle, handle_value)
             if duplicated is None:
                 continue
@@ -370,11 +463,19 @@ class SocketInjector:
                 kernel32.CloseHandle(duplicated)
             except OSError:
                 pass
+        if checked == 0:
+            hint = (
+                "No se pudo enumerar ningun handle del proceso. Ejecuta el programa "
+                "como Administrador; si ya lo haces, el proceso puede estar protegido."
+            )
+        else:
+            hint = (
+                "Ejecuta el programa como Administrador; si ya lo haces, el proceso "
+                "puede estar protegiendo sus handles."
+            )
         raise RuntimeError(
             f"No se pudo duplicar el socket de {target_remote[0]}:{target_remote[1]} "
-            f"(se comprobaron {checked} handles del proceso).\n"
-            "Ejecuta el programa como Administrador; si ya lo haces, el proceso "
-            "puede estar protegiendo sus handles."
+            f"(se comprobaron {checked} handles del proceso).\n{hint}"
         )
 
     def send(self, direction: str, text: str) -> int:

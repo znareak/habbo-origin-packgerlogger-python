@@ -58,9 +58,35 @@ print("filesource OK")
 # 5. Modulo Win32 importable
 import app.processio as processio
 
-assert callable(processio.enumerate_handles)
+assert callable(processio.enumerate_process_handles)
+assert callable(processio.enumerate_system_handles)
 assert callable(processio.find_process_connections)
 assert callable(processio.list_all_processes)
 print("processio OK")
+
+# 6. Decodificador Habbo (framing + parseo heuristico)
+from app.capture import (
+    extract_habbo_frames,
+    format_habbo_message,
+    parse_habbo_tokens,
+)
+
+frame = (6).to_bytes(4, "big") + (2430).to_bytes(2, "big") + (2).to_bytes(4, "big")
+assert extract_habbo_frames(bytearray(frame)) == [(2430, (2).to_bytes(4, "big"))]
+
+split = (14).to_bytes(4, "big") + (10).to_bytes(2, "big") + (3).to_bytes(4, "big") + b"ab123456"
+buffer = bytearray(split[:5])
+assert extract_habbo_frames(buffer) == []
+buffer.extend(split[5:])
+assert extract_habbo_frames(buffer) == [(10, (3).to_bytes(4, "big") + b"ab123456")]
+
+# resincronizacion ante basura inicial
+buffer = bytearray((99999999).to_bytes(4, "big") + split)
+assert extract_habbo_frames(buffer) == [(10, (3).to_bytes(4, "big") + b"ab123456")]
+
+tokens = parse_habbo_tokens((2).to_bytes(4, "big") + (5).to_bytes(2, "big") + b"habbo")
+assert tokens == [("i", 2), ("s", "habbo")]
+assert format_habbo_message("Recv", 2430, (2).to_bytes(4, "big")) == "Incoming [2430] i:2"
+print("habbo OK")
 
 print("TODAS LAS PRUEBAS OK")

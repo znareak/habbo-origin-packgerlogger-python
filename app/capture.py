@@ -55,6 +55,9 @@ class NpcapCaptureSource:
         self.queue: "queue.Queue[Packet]" = queue.Queue()
         self.info: dict = {}
         self._sniffer: Optional[AsyncSniffer] = None
+        # Modo de decodificacion Habbo (activado desde la interfaz)
+        self.habbo_decode = False
+        self._habbo_streams = {"Send": bytearray(), "Recv": bytearray()}
 
     def resolve(self) -> dict:
         """Devuelve la conexion a capturar. Lanza RuntimeError si no existe."""
@@ -146,8 +149,16 @@ class NpcapCaptureSource:
             local_port = self.info.get("local_port")
             direction = "Send" if sport == local_port else "Recv"
 
-        text = decode_payload(payload)
+        if self.habbo_decode and self.info.get("proto", "tcp") == "tcp":
+            self._habbo_streams[direction].extend(payload)
+            for header, body in extract_habbo_frames(self._habbo_streams[direction]):
+                self._emit_packet(direction, format_habbo_message(direction, header, body))
+            return
 
+        self._emit_packet(direction, decode_payload(payload))
+
+    def _emit_packet(self, direction: str, text: str) -> None:
+        remote_port = self.info.get("remote_port")
         source = (
             f"captura:{self.info.get('proto', 'tcp')}:"
             f"{self.info.get('remote_ip', '?')}:"
@@ -170,6 +181,7 @@ class NpcapCaptureSource:
             except Exception:
                 pass
             self._sniffer = None
+        self._habbo_streams = {"Send": bytearray(), "Recv": bytearray()}
 
     @property
     def running(self) -> bool:
@@ -184,3 +196,104 @@ class NpcapCaptureSource:
                 f"{self.info.get('remote_port') or self.info.get('local_port', '?')}"
             )
         return "captura Npcap (sin conexion)"
+
+
+# ---------------------------------------------------------------------------
+# Decodificador del protocolo binario de Habbo
+# ---------------------------------------------------------------------------
+#
+# El trafico de juego de Habbo (clientes 2015+) no va cifrado: cada mensaje es
+#   [longitud: int32 big-endian][header: int16 big-endian][cuerpo...]
+# donde la longitud incluye header (2 bytes) + cuerpo. Reensamblamos el flujo
+# TCP por direccion y decodificamos el cuerpo con una heuristica generica
+# (cadenas con prefijo de longitud, enteros, booleanos).
+
+HABBO_MAX_MESSAGE_LENGTH = 1 << 20  # 1 MB: si se supera, el flujo se desincronizo
+
+
+def extract_habbo_frames(buffer: bytearray):
+    """Extrae mensajes completos de un buffer TCP y los consume.
+
+    Devuelve una lista de (header, body). Los bytes incompletos quedan en el
+    buffer a la espera de mas datos. Si el flujo se desincroniza (longitud
+    absurda) descarta bytes de uno en uno hasta volver a sincronizar.
+    """
+    frames = []
+    while True:
+        if len(buffer) < 4:
+            break
+        length = int.from_bytes(buffer[0:4], "big")
+        if length < 2 or length > HABBO_MAX_MESSAGE_LENGTH:
+            del buffer[0]
+            continue
+        if len(buffer) < 4 + length:
+            break
+        header = int.from_bytes(buffer[4:6], "big")
+        body = bytes(buffer[6:4 + length])
+        del buffer[0:4 + length]
+        frames.append((header, body))
+    return frames
+
+
+def parse_habbo_tokens(body: bytes):
+    """Parsea el cuerpo de un mensaje Habbo con heuristica generica.
+
+    Devuelve una lista de (tipo, valor):
+      ('s', str)   cadena con longitud int16 big-endian
+      ('i', int)   entero int32 big-endian (bytes altos a cero, lo habitual)
+      ('h', int)   corto int16 big-endian
+      ('b', bool)  booleano (byte 0/1)
+      ('u', int)   byte crudo
+    """
+    tokens = []
+    index = 0
+    size = len(body)
+    while index < size:
+        # 1) Cadena con prefijo de longitud int16 BE
+        if index + 2 <= size:
+            string_len = int.from_bytes(body[index:index + 2], "big")
+            if 0 < string_len <= size - index - 2:
+                chunk = body[index + 2:index + 2 + string_len]
+                printable = sum(
+                    1 for byte in chunk if 32 <= byte < 127 or byte in (9, 10, 13)
+                )
+                if printable / len(chunk) >= 0.8:
+                    tokens.append(("s", chunk.decode("utf-8", "replace")))
+                    index += 2 + string_len
+                    continue
+        # 2) Entero int32 BE con bytes altos a cero (valores pequenos tipicos)
+        if index + 4 <= size and body[index] == 0 and body[index + 1] == 0:
+            tokens.append(("i", int.from_bytes(body[index:index + 4], "big")))
+            index += 4
+            continue
+        # 3) Corto int16 BE
+        if index + 2 <= size:
+            tokens.append(("h", int.from_bytes(body[index:index + 2], "big")))
+            index += 2
+            continue
+        # 4) Byte suelto (booleano o crudo)
+        byte = body[index]
+        index += 1
+        tokens.append(("b", byte == 1) if byte in (0, 1) else ("u", byte))
+    return tokens
+
+
+def format_habbo_message(direction: str, header: int, body: bytes) -> str:
+    """Formatea un mensaje Habbo para mostrarlo en el logger."""
+    if body:
+        tokens = " ".join(_format_habbo_token(token) for token in parse_habbo_tokens(body))
+    else:
+        tokens = "(vacio)"
+    side = "Incoming" if direction == "Recv" else "Outgoing"
+    return f"{side} [{header}] {tokens}"
+
+
+def _format_habbo_token(token) -> str:
+    kind, value = token
+    if kind == "s":
+        return f's:"{value}"'
+    if kind == "b":
+        return "b:true" if value else "b:false"
+    if kind == "u":
+        return f"u:0x{value:02x}"
+    return f"{kind}:{value}"

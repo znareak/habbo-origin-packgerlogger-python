@@ -16,6 +16,10 @@ proceso en ejecucion (uso educativo), en Python.
   protegidos.
 - **Perfiles de filtros** guardados como JSON en `profiles/` y cargados
   automaticamente al arrancar.
+- **Decodificador Habbo opcional**: con el checkbox "Habbo" de una pestaña de
+  captura TCP se reensamblan los mensajes del protocolo binario
+  (`longitud int32 + header int16 + cuerpo`) y se decodifican los campos
+  (cadenas, enteros, booleanos) de forma heuristica.
 - **Multiples fuentes simultaneas** en pestañas: click derecho sobre el titulo
   de una pestaña para **Flotar**, **Dividir** o **Cerrar**.
 - **Envio de paquetes una vez o periodicamente** (intervalo configurable),

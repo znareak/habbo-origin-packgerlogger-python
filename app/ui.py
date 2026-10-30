@@ -23,6 +23,7 @@ from .filters import PacketFilter, ProfileStore
 from .models import Packet
 from .processio import (
     SocketInjector,
+    best_tcp_connection,
     find_process_connections,
     find_tcp_connections,
     list_all_processes,
@@ -359,8 +360,15 @@ class SourceTab(ttk.Frame):
         self.start_button = ttk.Button(toolbar, text="Iniciar", command=self.toggle_start)
         self.start_button.pack(side="left")
         ttk.Button(toolbar, text="Limpiar", command=self._clear).pack(side="left", padx=4)
-        self.autoscroll_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(toolbar, text="Auto-scroll", variable=self.autoscroll_var).pack(side="left")
+        self.autoscroll_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            toolbar, text="Auto-scroll", variable=self.autoscroll_var
+        ).pack(side="left")
+        self.habbo_var = tk.BooleanVar(value=False)
+        if isinstance(source, NpcapCaptureSource):
+            ttk.Checkbutton(
+                toolbar, text="Habbo", variable=self.habbo_var, command=self._toggle_habbo
+            ).pack(side="left", padx=4)
         self.status_var = tk.StringVar(value="Detenido")
         ttk.Label(toolbar, textvariable=self.status_var, foreground="#555").pack(side="right")
 
@@ -453,6 +461,16 @@ class SourceTab(ttk.Frame):
 
     def _clear(self) -> None:
         self.grid.clear()
+
+    def _toggle_habbo(self) -> None:
+        """Activa o desactiva la decodificacion del protocolo Habbo en la captura."""
+        if isinstance(self.source, NpcapCaptureSource):
+            self.source.habbo_decode = self.habbo_var.get()
+            self.status_var.set(
+                "Decodificacion Habbo activada"
+                if self.habbo_var.get()
+                else "Decodificacion Habbo desactivada"
+            )
 
     # -- cola de paquetes ------------------------------------------------
 
@@ -796,8 +814,14 @@ class CaptureDialog(tk.Toplevel):
             self.conn_list.insert("end", "(sin conexiones TCP/UDP activas)")
             return
         self.connections = connections
+        best = best_tcp_connection(connections)
         for connection in connections:
-            self.conn_list.insert("end", self._conn_label(connection))
+            label = self._conn_label(connection)
+            if connection is best:
+                label += "  <- recomendada"
+            self.conn_list.insert("end", label)
+        if best is not None:
+            self.conn_list.selection_set(connections.index(best))
 
     @staticmethod
     def _conn_label(connection: dict) -> str:
@@ -841,7 +865,7 @@ class CaptureDialog(tk.Toplevel):
 class InjectorDialog(tk.Toplevel):
     """Creacion de un inyector conectado a un proceso (cualquier programa)."""
 
-    AUTO_FIRST = "(auto: primera TCP)"
+    AUTO_FIRST = "(auto: recomendada)"
 
     def __init__(self, master, settings: dict):
         super().__init__(master)
@@ -932,10 +956,14 @@ class InjectorDialog(tk.Toplevel):
             return
         self.connections = connections
         self.conn_list.insert("end", self.AUTO_FIRST)
+        best = best_tcp_connection(connections)
         for connection in connections:
-            self.conn_list.insert(
-                "end", f"{connection['remote_ip']}:{connection['remote_port']}"
-            )
+            label = f"{connection['remote_ip']}:{connection['remote_port']}"
+            if connection is best:
+                label += "  <- recomendada"
+            self.conn_list.insert("end", label)
+        if best is not None:
+            self.conn_list.selection_set(connections.index(best) + 1)
 
     def _selected_connection(self):
         selection = self.conn_list.curselection()

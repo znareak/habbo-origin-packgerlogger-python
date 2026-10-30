@@ -135,6 +135,7 @@ class PacketGrid(ttk.Frame):
             font=mono_font,
             relief="flat",
             borderwidth=0,
+            padding=(8, 6),
         )
         style.map("Treeview.Heading", background=[("active", DARK_HOVER)])
         self.tree = ttk.Treeview(self, columns=self.columns, show="headings", selectmode="browse")
@@ -356,7 +357,7 @@ class SendPanel(ttk.LabelFrame):
         self.injectors_provider = injectors_provider  # -> (labels, selected_index)
 
         row = ttk.Frame(self)
-        row.pack(fill="x", padx=4, pady=2)
+        row.pack(fill="x", padx=8, pady=4)
         ttk.Label(row, text="Direccion:").pack(side="left")
         self.direction_var = tk.StringVar(value="Send")
         ttk.Combobox(
@@ -370,13 +371,13 @@ class SendPanel(ttk.LabelFrame):
         ttk.Button(row, text="Actualizar", command=self.refresh_injectors).pack(side="left", padx=4)
 
         entry_row = ttk.Frame(self)
-        entry_row.pack(fill="x", padx=4, pady=2)
+        entry_row.pack(fill="x", padx=8, pady=4)
         ttk.Label(entry_row, text="Paquete:").pack(side="left")
         self.packet_var = tk.StringVar()
         ttk.Entry(entry_row, textvariable=self.packet_var).pack(side="left", fill="x", expand=True, padx=4)
 
         btn_row = ttk.Frame(self)
-        btn_row.pack(fill="x", padx=4, pady=2)
+        btn_row.pack(fill="x", padx=8, pady=4)
         ttk.Button(btn_row, text="Enviar una vez", command=self.send_once).pack(side="left")
         ttk.Label(btn_row, text="Intervalo (s):").pack(side="left", padx=(10, 2))
         self.interval_var = tk.DoubleVar(value=1.0)
@@ -434,7 +435,7 @@ class SourceTab(ttk.Frame):
         self._send_lock = threading.Lock()
 
         toolbar = ttk.Frame(self)
-        toolbar.pack(fill="x", padx=4, pady=(4, 0))
+        toolbar.pack(fill="x", padx=8, pady=(8, 0))
         self.start_button = ttk.Button(toolbar, text="Iniciar", command=self.toggle_start)
         self.start_button.pack(side="left")
         ttk.Button(toolbar, text="Limpiar", command=self._clear).pack(side="left", padx=4)
@@ -451,13 +452,13 @@ class SourceTab(ttk.Frame):
         ttk.Label(toolbar, textvariable=self.status_var, foreground="#9a9a9a").pack(side="right")
 
         self.filter_bar = FilterBar(self, profile_store, on_change=self._apply_filter)
-        self.filter_bar.pack(fill="x", padx=4, pady=2)
+        self.filter_bar.pack(fill="x", padx=8, pady=6)
 
         self.grid = PacketGrid(self, on_send_packet=self._send_packet_from_grid)
-        self.grid.pack(fill="both", expand=True, padx=4, pady=2)
+        self.grid.pack(fill="both", expand=True, padx=8, pady=6)
 
         self.send_panel = SendPanel(self, on_send=self._send, injectors_provider=self._injector_options)
-        self.send_panel.pack(fill="x", padx=4, pady=(2, 4))
+        self.send_panel.pack(fill="x", padx=8, pady=(6, 8))
         # Conecta el boton periodico con el bucle real de envio
         self.send_panel.periodic_button.configure(command=self._toggle_periodic)
 
@@ -655,7 +656,7 @@ class SourceTab(ttk.Frame):
 
     def _show_file_replay(self) -> None:
         frame = ttk.LabelFrame(self, text="Reproducir archivo")
-        frame.pack(fill="x", padx=4, pady=(0, 4))
+        frame.pack(fill="x", padx=8, pady=(0, 8))
         self.replay_frame = frame
         ttk.Button(frame, text="Reenviar todos (1 vez)", command=self._replay_once).pack(
             side="left", padx=4, pady=2
@@ -815,7 +816,7 @@ class CaptureDialog(tk.Toplevel):
         self.configure(bg=DARK_BG)
         self.result: Optional[dict] = None
 
-        body = ttk.Frame(self, padding=10)
+        body = ttk.Frame(self, padding=14)
         body.grid(row=0, column=0, sticky="nsew")
 
         # -- Proceso --
@@ -969,7 +970,7 @@ class InjectorDialog(tk.Toplevel):
         self.configure(bg=DARK_BG)
         self.result: Optional[dict] = None
 
-        body = ttk.Frame(self, padding=10)
+        body = ttk.Frame(self, padding=14)
         body.grid(row=0, column=0, sticky="nsew")
 
         ttk.Label(body, text="Proceso:").grid(row=0, column=0, sticky="w")
@@ -1098,7 +1099,7 @@ class ProfileManager(tk.Toplevel):
         self.configure(bg=DARK_BG)
         self.store = profile_store
 
-        body = ttk.Frame(self, padding=8)
+        body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
 
         left = ttk.Frame(body)
@@ -1258,7 +1259,7 @@ class App(tk.Tk):
         style.configure(".", background=background, foreground=DARK_FG)
         style.configure("TFrame", background=background)
         style.configure("TLabel", background=background, foreground=DARK_FG)
-        style.configure("TButton", background=DARK_BUTTON, foreground=DARK_FG)
+        style.configure("TButton", background=DARK_BUTTON, foreground=DARK_FG, padding=(10, 5))
         style.configure(
             "TButton",
             bordercolor=DARK_BORDER,
@@ -1266,7 +1267,9 @@ class App(tk.Tk):
             darkcolor=DARK_BORDER,
         )
         style.map("TButton", background=[("active", DARK_HOVER)])
-        style.configure("TCheckbutton", background=background, foreground=DARK_FG)
+        style.configure(
+            "TCheckbutton", background=background, foreground=DARK_FG, padding=(4, 4)
+        )
         style.configure(
             "TCheckbutton",
             indicatorbackground=DARK_FIELD,
@@ -1275,7 +1278,7 @@ class App(tk.Tk):
             darkcolor=DARK_BORDER,
         )
         style.map("TCheckbutton", background=[("active", background)])
-        style.configure("TRadiobutton", background=background, foreground=DARK_FG)
+        style.configure("TRadiobutton", background=background, foreground=DARK_FG, padding=(4, 4))
         style.configure(
             "TRadiobutton",
             indicatorbackground=DARK_FIELD,
@@ -1285,7 +1288,8 @@ class App(tk.Tk):
         )
         style.map("TRadiobutton", background=[("active", background)])
         style.configure(
-            "TEntry", fieldbackground=DARK_FIELD, foreground=DARK_FG, insertcolor=DARK_FG
+            "TEntry", fieldbackground=DARK_FIELD, foreground=DARK_FG, insertcolor=DARK_FG,
+            padding=(5, 4),
         )
         style.configure(
             "TEntry",
@@ -1302,10 +1306,12 @@ class App(tk.Tk):
             bordercolor=DARK_BORDER,
             lightcolor=DARK_BORDER,
             darkcolor=DARK_BORDER,
+            padding=(5, 4),
         )
         style.map("TCombobox", fieldbackground=[("readonly", DARK_FIELD)])
         style.configure(
-            "TSpinbox", fieldbackground=DARK_FIELD, background=DARK_BUTTON, foreground=DARK_FG
+            "TSpinbox", fieldbackground=DARK_FIELD, background=DARK_BUTTON, foreground=DARK_FG,
+            padding=(5, 4),
         )
         style.configure(
             "TSpinbox",
@@ -1315,7 +1321,8 @@ class App(tk.Tk):
             arrowcolor=DARK_FG,
         )
         style.configure(
-            "TLabelframe", background=background, foreground=DARK_FG, bordercolor=DARK_BORDER
+            "TLabelframe", background=background, foreground=DARK_FG, bordercolor=DARK_BORDER,
+            padding=10,
         )
         style.configure("TLabelframe.Label", background=background, foreground=DARK_FG)
         style.configure("TNotebook", background=background, borderwidth=0)
@@ -1332,6 +1339,7 @@ class App(tk.Tk):
             bordercolor=DARK_BORDER,
             lightcolor=DARK_BORDER,
             darkcolor=DARK_BORDER,
+            padding=(14, 6),
         )
         style.map(
             "TNotebook.Tab",

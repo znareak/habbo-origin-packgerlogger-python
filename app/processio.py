@@ -828,3 +828,83 @@ def scan_process_for_bytes(process, needle: bytes, limit: int = 1000):
         return found
     finally:
         kernel32.CloseHandle(handle)
+
+
+def scan_rc4_cells_in_chunk(chunk: bytes, base_address: int):
+    """Busca corridas de 256 celdas int32 con byte bajo distinto y 3 altos a cero.
+
+    Asi guarda el cliente Flash la tabla RC4 en memoria (256 enteros de 32
+    bits, como hace G-Mem). Devuelve [(direccion, 256 valores)].
+    """
+    if len(chunk) < 1024:
+        return []
+    zero_to_one = bytearray(256)
+    zero_to_one[0] = 1
+    zero_to_one = bytes(zero_to_one)
+
+    c1 = chunk[1::4]
+    c2 = chunk[2::4]
+    c3 = chunk[3::4]
+    cells = min(len(c1), len(c2), len(c3))
+    if cells < 256:
+        return []
+    c0 = chunk[0:4 * cells:4]
+
+    z1 = int.from_bytes(c1[:cells].translate(zero_to_one), "little")
+    z2 = int.from_bytes(c2[:cells].translate(zero_to_one), "little")
+    z3 = int.from_bytes(c3[:cells].translate(zero_to_one), "little")
+    ok = z1 & z2 & z3
+    if not ok:
+        return []
+
+    # Rachas de al menos 256 celdas validas consecutivas. Cada celda ocupa un
+    # byte en el entero (bit real = 8 x indice), asi que los desplazamientos
+    # van en multiplos de 8.
+    runs = ok
+    for shift in (8, 16, 32, 64, 128, 256, 512, 1024):
+        runs &= runs >> shift
+    if not runs:
+        return []
+
+    starts = runs & ~(runs >> 8)
+    found = []
+    while starts:
+        low_bit = starts & -starts
+        index = (low_bit.bit_length() - 1) // 8
+        starts ^= low_bit
+        values = c0[index:index + 256]
+        if len(set(values)) != 256:
+            continue
+        found.append((base_address + 4 * index, bytes(values)))
+        if len(found) >= 50:
+            break
+    return found
+
+
+def scan_process_rc4_cells(
+    process,
+    max_bytes: int = 512 * 1024 * 1024,
+    progress=None,
+):
+    """Escanea la memoria del proceso en busca de tablas RC4 como celdas int32."""
+    handle = open_process(process.pid)
+    if not handle:
+        raise RuntimeError(f"No se pudo abrir el proceso {process.pid}")
+    try:
+        found = []
+        scanned = 0
+        for start, size in list_readable_regions(handle, private_only=False):
+            if scanned >= max_bytes:
+                break
+            chunk = read_process_memory(handle, start, min(size, 32 * 1024 * 1024))
+            if not chunk:
+                continue
+            scanned += len(chunk)
+            if progress is not None:
+                progress(scanned)
+            found.extend(scan_rc4_cells_in_chunk(chunk, start))
+            if len(found) >= 50:
+                break
+        return found
+    finally:
+        kernel32.CloseHandle(handle)

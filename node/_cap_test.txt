@@ -1,0 +1,8 @@
+[*] Motor: raw socket de Windows (PowerShell, sin Python ni Npcap).
+[*] Filtro: tcp ?:? <-> 1.1.1.1:80
+[*] Capturando (Ctrl+C para salir)...
+
+[INFO] Captura iniciada. Esperando paquetes de la conexion...
+[INFO] Escuchando... paquetes IP vistos: 0, de la conexion: 0
+[INFO] Escuchando... paquetes IP vistos: 0, de la conexion: 0
+[INFO] Escuchando... paquetes IP vistos: 0, de la conexion: 0

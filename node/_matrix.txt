@@ -1,0 +1,4 @@
+﻿bind=192.168.1.12 ctl=ReceiveAll mode=1 -> total=1164 inbound=0 outbound=109
+bind=0.0.0.0 ctl=ReceiveAll mode=1 -> CTL_FAIL Excepción al llamar a "IOControl" con los argumentos "3": "Se ha proporcionado un argumento no válido"
+bind=0.0.0.0 ctl=ReceiveAllMulticast mode=1 -> CTL_FAIL Excepción al llamar a "IOControl" con los argumentos "3": "Se ha proporcionado un argumento no válido"
+bind=192.168.1.12 ctl=ReceiveAllMulticast mode=1 -> total=0 inbound=0 outbound=0

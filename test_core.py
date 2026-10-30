@@ -350,4 +350,26 @@ assert score == 3 and shift == 35, (shift, score)
 assert _find_alignment(list(snapshot.sbox), 1, 2, align_cipher) == (None, 0)
 print("align OK")
 
+# 13. Crack estilo G-Earth: primeros bytes cifrados + tabla -> (i, j, score)
+from app.capture import _crack_table_from_stream_start
+
+crack_key = RC4State.from_key(b"K")
+crack_plain = framed_ok * 2
+crack_enc = crack_key.crypt(crack_plain)
+snap_i, snap_j = crack_key.i, crack_key.j
+result = _crack_table_from_stream_start(crack_enc, list(crack_key.sbox))
+assert result == (snap_i, snap_j, 2), result
+print("crack OK")
+
+# 14. Escaner de celdas int32 (tabla RC4 del cliente Flash, como G-Mem)
+from app.processio import scan_rc4_cells_in_chunk
+
+cells = b"".join(bytes([value, 0, 0, 0]) for value in range(256))
+chunk = b"\x01\x02\x03\x04" * 100 + cells + b"\x05\x06\x07\x08" * 50
+hits = scan_rc4_cells_in_chunk(chunk, 0x1000)
+assert hits and hits[0][0] == 0x1000 + 4 * 100, hits
+assert hits[0][1] == bytes(range(256)), hits[0][1][:4]
+assert scan_rc4_cells_in_chunk(b"\x00" * 2048, 0) == []
+print("cells OK")
+
 print("TODAS LAS PRUEBAS OK")

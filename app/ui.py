@@ -612,22 +612,37 @@ class SourceTab(ttk.Frame):
             )
 
     def _find_rc4(self) -> None:
-        """Busca el estado RC4 del proceso en memoria y lo aplica a los Send."""
+        """Activa el descifrado RC4: intento inmediato + auto al reconectar."""
         if not isinstance(self.source, NpcapCaptureSource):
             return
-        self.status_var.set("Buscando estado RC4 en la memoria del proceso...")
+        self.source.on_rc4_progress = lambda message: self.status_var.set(message)
+        self.source.on_rc4_result = self._on_rc4_result
+        self.source.auto_crack = True
+        self.status_var.set(
+            "Modo RC4 activo: intentando ahora y automaticamente cuando el "
+            "juego reconecte."
+        )
 
         def worker():
             try:
-                def progress(message: str) -> None:
-                    self.status_var.set(message)
-
-                message = self.source.find_rc4_state(progress=progress)
+                message = self.source.find_rc4_state(
+                    progress=lambda text: self.status_var.set(text)
+                )
                 self.status_var.set(message)
+                if self.source.rc4_state is not None:
+                    self.source.auto_crack = False
             except Exception as exc:
-                self._report_error(f"RC4: {exc}")
+                self.status_var.set(
+                    f"RC4: {exc} | Se reintentara cuando el juego reconecte."
+                )
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_rc4_result(self, message: str) -> None:
+        """Se llama desde el hilo de crack automatico (tras reconectar)."""
+        self.status_var.set(message)
+        if self.source.rc4_state is not None:
+            self.source.auto_crack = False
 
     # -- cola de paquetes ------------------------------------------------
 

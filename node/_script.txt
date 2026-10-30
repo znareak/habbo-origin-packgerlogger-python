@@ -1,0 +1,251 @@
+$ErrorActionPreference = 'SilentlyContinue'
+$LocalIP = '192.168.1.12'
+$LocalPort = 0
+$RemoteIP = '1.1.1.1'
+$RemotePort = 80
+$ProtoNum = 6
+$UdpLen = 0
+if ($LocalIP -eq '') {
+  # averiguar la IP local de la ruta hacia el servidor (sin enviar trafico)
+  $probe = New-Object System.Net.Sockets.Socket([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Dgram, [System.Net.Sockets.ProtocolType]::Udp)
+  $probe.Connect($RemoteIP, 9)
+  $LocalIP = $probe.LocalEndPoint.Address.ToString()
+  $probe.Close()
+}
+$lp = [System.Net.IPAddress]::Parse($LocalIP).GetAddressBytes()
+$rp = [System.Net.IPAddress]::Parse($RemoteIP).GetAddressBytes()
+$buf = New-Object byte[] 65536
+function Same4([byte[]]$b, [int]$o, [byte[]]$ip) {
+  return ($b[$o] -eq $ip[0] -and $b[$o+1] -eq $ip[1] -and $b[$o+2] -eq $ip[2] -and $b[$o+3] -eq $ip[3])
+}
+function Format-Pkt([byte[]]$b, [int]$n, [int]$base) {
+  if ($base -ge $n -or (($b[$base] -band 0xF0) -ne 0x40) -or $b[$base+9] -ne $ProtoNum) { return $null }
+  $ihl = ($b[$base] -band 0x0F) * 4
+  $srcPort = $b[$base+$ihl] * 256 + $b[$base+$ihl+1]
+  $dstPort = $b[$base+$ihl+2] * 256 + $b[$base+$ihl+3]
+  if ($UdpLen -gt 0) { $dataOff = $base + $ihl + $UdpLen }
+  else { $dataOff = $base + $ihl + ((($b[$base+$ihl+12] -band 0xF0) -shr 4) * 4) }
+  if ($dataOff -ge $n) { return $null }
+  $dir = ''
+  if ((Same4 $b ($base+12) $lp) -and ($LocalPort -eq 0 -or $srcPort -eq $LocalPort) -and (Same4 $b ($base+16) $rp) -and $dstPort -eq $RemotePort) { $dir = 'Send' }
+  elseif ((Same4 $b ($base+12) $rp) -and $srcPort -eq $RemotePort -and (Same4 $b ($base+16) $lp) -and ($LocalPort -eq 0 -or $dstPort -eq $LocalPort)) { $dir = 'Recv' }
+  else { return $null }
+  $len = $n - $dataOff
+  $payload = New-Object byte[] $len
+  [Array]::Copy($b, $dataOff, $payload, 0, $len)
+  $t = Get-Date -Format 'HH:mm:ss'
+  $b64 = [System.Convert]::ToBase64String($payload)
+  return ("[{0}]`t[{1}]`t{2}" -f $t, $dir, $b64)
+}
+
+# ---------- motor 1: Npcap via wpcap.dll ----------
+$haveNpcap = $false
+$capH = [IntPtr]::Zero
+Write-Output '[INFO] Paso 1/5: compilando helper de Npcap (Add-Type)...'
+[Console]::Out.Flush()
+try {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+[StructLayout(LayoutKind.Sequential)]
+public struct pcap_if_t {
+  public IntPtr next;
+  public IntPtr name;
+  public IntPtr description;
+  public IntPtr addresses;
+  public uint flags;
+}
+[StructLayout(LayoutKind.Sequential)]
+public struct bpf_program_t {
+  public uint bf_len;
+  public IntPtr bf_insns;
+}
+public static class Npcap {
+  [DllImport("wpcap.dll", CharSet = CharSet.Ansi)]
+  public static extern int pcap_findalldevs(ref IntPtr alldevs, System.Text.StringBuilder errbuf);
+  [DllImport("wpcap.dll")]
+  public static extern void pcap_freealldevs(IntPtr alldevs);
+  [DllImport("wpcap.dll", CharSet = CharSet.Ansi)]
+  public static extern IntPtr pcap_open_live(string device, int snaplen, int promisc, int to_ms, System.Text.StringBuilder errbuf);
+  [DllImport("wpcap.dll", CharSet = CharSet.Ansi)]
+  public static extern int pcap_next_ex(IntPtr p, ref IntPtr hdr, ref IntPtr data);
+  [DllImport("wpcap.dll")]
+  public static extern int pcap_datalink(IntPtr p);
+  [DllImport("wpcap.dll", CharSet = CharSet.Ansi)]
+  public static extern int pcap_compile(IntPtr p, ref bpf_program_t fp, string str, int optimize, uint netmask);
+  [DllImport("wpcap.dll")]
+  public static extern int pcap_setfilter(IntPtr p, ref bpf_program_t fp);
+  [DllImport("wpcap.dll")]
+  public static extern void pcap_close(IntPtr p);
+}
+'@
+  $haveNpcap = $true
+  Write-Output '[INFO] Paso 2/5: helper compilado OK (wpcap.dll encontrada).'
+  [Console]::Out.Flush()
+} catch {
+  $haveNpcap = $false
+  Write-Output ('[INFO] Paso 2/5: Add-Type fallo: ' + $_.Exception.Message)
+  [Console]::Out.Flush()
+}
+if ($haveNpcap) {
+  # El servicio Npcap parado puede hacer que pcap_open_live se quede colgado;
+  # intentamos arrancarlo antes (somos administrador).
+  try {
+    $svc = Get-Service npcap,npf -ErrorAction Stop | Where-Object { $_.Status -ne 'Running' }
+    foreach ($s in $svc) { try { $s | Start-Service -ErrorAction Stop } catch { } }
+    Write-Output '[INFO] Paso 3/5: servicio Npcap comprobado.'
+    [Console]::Out.Flush()
+  } catch {
+    Write-Output '[INFO] Paso 3/5: no se pudo comprobar el servicio (se continua).'
+    [Console]::Out.Flush()
+  }
+  $sb = New-Object System.Text.StringBuilder 256
+  $devPtr = [IntPtr]::Zero
+  $devName = $null
+  $firstDev = $null
+  $devCount = 0
+  # Nombre amistoso del adaptador de la IP local (via WMI; los cmdlets
+  # NetTCPIP a veces se cuelgan).
+  $alias = $null
+  try {
+    Write-Output '[INFO] Paso 4/6: buscando adaptador de la IP local (WMI)...'
+    [Console]::Out.Flush()
+    $cfg = Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' -ErrorAction Stop | Where-Object { $_.IPAddress -contains $LocalIP } | Select-Object -First 1
+    if ($cfg) {
+      $nad = Get-WmiObject Win32_NetworkAdapter -Filter ("Index=" + $cfg.Index) -ErrorAction Stop
+      if ($nad -and $nad.NetConnectionID) { $alias = [string]$nad.NetConnectionID }
+    }
+    Write-Output ('[INFO] Paso 4/6: adaptador: ' + $alias)
+    [Console]::Out.Flush()
+  } catch {
+    Write-Output ('[INFO] Paso 4/6: WMI fallo: ' + $_.Exception.Message)
+    [Console]::Out.Flush()
+  }
+  $rc = -1
+  try {
+    Write-Output '[INFO] Paso 5/6: pcap_findalldevs...'
+    [Console]::Out.Flush()
+    $rc = [Npcap]::pcap_findalldevs([ref]$devPtr, $sb)
+    Write-Output ('[INFO] Paso 5/6: findalldevs rc=' + $rc)
+    [Console]::Out.Flush()
+  } catch {
+    Write-Output ('[INFO] Paso 5/6: findalldevs EXC: ' + $_.Exception.Message)
+    [Console]::Out.Flush()
+  }
+  if ($rc -eq 0 -and $devPtr -ne [IntPtr]::Zero) {
+    $guard = 0
+    $cur = $devPtr
+    while ($cur -ne [IntPtr]::Zero -and $guard -lt 128) {
+      $guard++
+      try {
+        $entry = [System.Runtime.InteropServices.Marshal]::PtrToStructure($cur, [pcap_if_t])
+        $name = [System.Runtime.InteropServices.Marshal]::PtrToStringAnsi($entry.name)
+        $desc = [System.Runtime.InteropServices.Marshal]::PtrToStringAnsi($entry.description)
+        if (-not $name) { break }
+        $devCount++
+        if (-not $firstDev) { $firstDev = $name }
+        if ($LocalIP.StartsWith('127.')) {
+          if ($desc -and $desc.ToLower().Contains('loopback')) { $devName = $name; break }
+        } elseif ($alias -and $desc -and $desc.ToLower().Contains($alias.ToLower())) {
+          $devName = $name
+          break
+        }
+        $cur = $entry.next
+      } catch {
+        Write-Output ('[INFO] Paso 5/6: error al recorrer dispositivos: ' + $_.Exception.Message)
+        [Console]::Out.Flush()
+        break
+      }
+    }
+    [Npcap]::pcap_freealldevs($devPtr)
+    if (-not $devName) { $devName = $firstDev }
+  }
+  Write-Output ('[INFO] Paso 6/6: dispositivos: ' + $devCount + ', elegido: ' + $devName)
+  [Console]::Out.Flush()
+  if ($devName) {
+    $err = New-Object System.Text.StringBuilder 256
+    Write-Output ('[INFO] Abriendo ' + $devName + '...')
+    [Console]::Out.Flush()
+    $capH = [Npcap]::pcap_open_live($devName, 65535, 1, 500, $err)
+    if ($capH -eq [IntPtr]::Zero) {
+      Write-Output ("[INFO] Npcap no se pudo abrir en '{0}': {1}. Usando raw socket (solo Send)." -f $devName, $err.ToString())
+      [Console]::Out.Flush()
+      $capH = [IntPtr]::Zero
+    } else {
+      $fp = New-Object bpf_program_t
+      $protoStr = $(if ($ProtoNum -eq 17) { 'udp' } else { 'tcp' })
+      $fstr = "$protoStr and host $RemoteIP and port $RemotePort"
+      if ([Npcap]::pcap_compile($capH, [ref]$fp, $fstr, 1, [uint32]0xffffffff) -ge 0) {
+        $null = [Npcap]::pcap_setfilter($capH, [ref]$fp)
+      }
+      $dlt = [Npcap]::pcap_datalink($capH)
+      Write-Output ("[INFO] Capturando con Npcap ({0}). Esperando paquetes de la conexion..." -f $devName)
+      [Console]::Out.Flush()
+    }
+  }
+}
+
+# ---------- motor 2 (respaldo): raw socket ----------
+$sock = $null
+if ($capH -eq [IntPtr]::Zero) {
+  try {
+    $sock = New-Object System.Net.Sockets.Socket([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Raw, [System.Net.Sockets.ProtocolType]::IP)
+    $sock.Bind((New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($LocalIP), 0)))
+    $inBuf = [System.BitConverter]::GetBytes([int]1)
+    $null = $sock.IOControl([System.Net.Sockets.IOControlCode]::ReceiveAll, $inBuf, $null)
+    $sock.ReceiveTimeout = 1000
+    Write-Output '[INFO] Capturando con raw socket (solo se veran los Send).'
+    [Console]::Out.Flush()
+  } catch {
+    Write-Output '[ERR] No se pudo abrir ninguna captura (Npcap ni raw socket).'
+    exit 1
+  }
+}
+
+# ---------- bucle ----------
+$total = 0
+$matched = 0
+$lastInfo = [DateTime]::MinValue
+$hdr = [IntPtr]::Zero
+$data = [IntPtr]::Zero
+while ($true) {
+  if ($capH -ne [IntPtr]::Zero) {
+    $r = [Npcap]::pcap_next_ex($capH, [ref]$hdr, [ref]$data)
+    if ($r -le 0) {
+      if (((Get-Date) - $lastInfo).TotalSeconds -ge 5) {
+        $lastInfo = Get-Date
+        Write-Output ("[INFO] Escuchando... paquetes vistos: {0}, de la conexion: {1}" -f $total, $matched)
+        [Console]::Out.Flush()
+      }
+      continue
+    }
+    $n = [System.Runtime.InteropServices.Marshal]::ReadInt32($hdr, 8)
+    if ($n -le 0) { continue }
+    [System.Runtime.InteropServices.Marshal]::Copy($data, $buf, 0, $n)
+    if ($dlt -eq 0) {
+      # DLT_NULL (loopback): 4 bytes de familia y despues IP
+      $base = 4
+    } else {
+      $base = 14
+      $et = $buf[12] * 256 + $buf[13]
+      if ($et -eq 0x8100) { $base = 18 }
+    }
+  } else {
+    try { $n = $sock.Receive($buf) } catch { $n = 0 }
+    if (((Get-Date) - $lastInfo).TotalSeconds -ge 5) {
+      $lastInfo = Get-Date
+      Write-Output ("[INFO] Escuchando... paquetes vistos: {0}, de la conexion: {1}" -f $total, $matched)
+      [Console]::Out.Flush()
+    }
+    if ($n -lt 20) { continue }
+    $base = 0
+  }
+  $total++
+  $line = Format-Pkt $buf $n $base
+  if ($line) {
+    $matched++
+    $lastInfo = Get-Date
+    Write-Output $line
+    [Console]::Out.Flush()
+  }
+}

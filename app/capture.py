@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import threading
 from datetime import datetime
 from typing import Callable, List, Optional
 
@@ -70,29 +71,71 @@ def _find_alignment(sbox, i_value: int, j_value: int, tail: bytes, max_shift: in
     return best
 
 
+def _crack_table_from_stream_start(enc: bytes, sbox):
+    """Metodo de G-Earth: con los primeros bytes cifrados del flujo, probar la
+    tabla deshaciendo el RC4 hasta el inicio (x == 0 e y == 0 al deshacer).
+
+    Devuelve (i, j, score) del estado al FINAL del buffer (el estado actual),
+    o None si la tabla no cuadra.
+    """
+    from .crypto import RC4State
+
+    length = len(enc)
+    i_snapshot = length % 256  # deshacer `length` pasos debe dejar x == 0
+    for j in range(256):
+        state = RC4State(list(sbox), i_snapshot, j)
+        for _ in range(length):
+            state.step_back()
+        if state.i != 0 or state.j != 0:
+            continue
+        zero = RC4State(list(state.sbox), 0, 0)
+        score = _frame_score(zero.crypt(enc))
+        if score >= 1:
+            return i_snapshot, j, score
+    return None
+
+
 def _verify_rc4_candidates(candidates, handle, tail: bytes, current_best):
     """Prueba cada tabla candidata con los valores i/j de su vecindario.
 
-    Devuelve la mejor tupla (score, (sbox, i, j, direccion)) encontrada.
+    El estado RC4 muta constantemente, asi que la tabla y su vecindario se
+    releen A LA VEZ (una sola lectura de memoria) y se conservan los OFFSETS
+    de i/j dentro de esa ventana para poder releerlos justo antes de aplicar.
+
+    Devuelve (score, (direccion, off_i, off_j, sbox, i, j)).
     """
-    from .crypto import RC4State
-    from .processio import read_nearby_bytes
+    from .crypto import is_permutation
+    from .processio import read_process_memory
 
     best = current_best
-    for address, sbox in candidates:
-        nearby = read_nearby_bytes(handle, address, 64)
-        values = []
-        # Los campos i/j suelen estar pegados a la tabla (antes o despues)
-        for value in list(nearby[48:64]) + list(nearby[320:336]) + list(nearby):
-            if value not in values:
-                values.append(value)
-            if len(values) >= 12:
+    for address, _stale_sbox in candidates:
+        window = read_process_memory(handle, address - 64, 384)
+        if not window or len(window) < 384:
+            continue
+        sbox = bytes(window[64:320])
+        if not is_permutation(sbox):
+            continue  # la tabla ya no esta ahi (se movio o el proceso cerro)
+        # Orden preferente: 16 bytes antes de la tabla, 16 despues, el resto
+        ordered = bytes(window[48:64]) + bytes(window[320:336]) + bytes(window)
+        value_offsets = []
+        seen = set()
+        for index, value in enumerate(ordered):
+            if value in seen:
+                continue
+            seen.add(value)
+            value_offsets.append(index)
+            if len(value_offsets) >= 12:
                 break
-        for i_value in values:
-            for j_value in values:
+        for off_i in value_offsets:
+            for off_j in value_offsets:
+                i_value = ordered[off_i]
+                j_value = ordered[off_j]
                 _shift, score = _find_alignment(sbox, i_value, j_value, tail)
                 if score > best[0]:
-                    best = (score, (list(sbox), i_value, j_value, address))
+                    best = (
+                        score,
+                        (address, off_i, off_j, list(sbox), i_value, j_value),
+                    )
                 if best[0] >= 4:
                     return best
     return best
@@ -129,6 +172,19 @@ class NpcapCaptureSource:
         self.rc4_raw = bytearray()   # ultima salida Send cifrada capturada
         self.rc4_raw_limit = 256 * 1024
         self.rc4_process = process
+        # Primeros bytes cifrados del flujo (tras el handshake): permiten el
+        # metodo G-Earth de crack (undo hasta el inicio del flujo).
+        self.send_enc = bytearray()
+        self.send_enc_limit = 4096
+        self._send_fresh = False
+        self._send_plain = bytearray()
+        self._send_enc_started = False
+        self._enc_lock = threading.Lock()
+        # Crack automatico al detectar una reconexion del juego
+        self.auto_crack = False
+        self._crack_running = False
+        self.on_rc4_result = None      # callback(mensaje)
+        self.on_rc4_progress = None    # callback(mensaje)
         self._binary_streams = {"Send": bytearray(), "Recv": bytearray()}
         self._binary_framed = {"Send": False, "Recv": False}
 
@@ -226,6 +282,12 @@ class NpcapCaptureSource:
             self._binary_streams["Recv"].clear()
             self._binary_framed["Send"] = False
             self._binary_framed["Recv"] = False
+            # Nueva sesion: volver a buscar el inicio del flujo cifrado
+            self._send_fresh = True
+            self._send_plain.clear()
+            self._send_enc_started = False
+            with self._enc_lock:
+                self.send_enc.clear()
             if self.rc4_state is not None:
                 self.rc4_state = None
                 self.rc4_raw.clear()
@@ -243,6 +305,25 @@ class NpcapCaptureSource:
             overflow = len(self.rc4_raw) - self.rc4_raw_limit
             if overflow > 0:
                 del self.rc4_raw[:overflow]
+            # Seguimiento del inicio del flujo cifrado (tras el handshake)
+            if self._send_fresh and not self._send_enc_started:
+                self._send_plain.extend(payload)
+                frames, _dropped = extract_binary_frames_resync(self._send_plain)
+                if frames:
+                    # El primer mensaje saliente es el handshake en claro;
+                    # lo que queda en el buffer ya es flujo cifrado.
+                    self._send_enc_started = True
+                    with self._enc_lock:
+                        self.send_enc.extend(bytes(self._send_plain))
+                        overflow = len(self.send_enc) - self.send_enc_limit
+                        if overflow > 0:
+                            del self.send_enc[:overflow]
+                    self._send_plain.clear()
+            elif self._send_fresh and self._send_enc_started:
+                with self._enc_lock:
+                    if len(self.send_enc) < self.send_enc_limit:
+                        self.send_enc.extend(payload)
+            self._maybe_auto_crack()
 
         if self.binary_decode and self.info.get("proto", "tcp") == "tcp":
             stream = self._binary_streams[direction]
@@ -334,6 +415,32 @@ class NpcapCaptureSource:
         self._binary_framed["Send"] = False
         self.rc4_raw.clear()
 
+    def _maybe_auto_crack(self) -> None:
+        """Si el modo automatico esta activo y ya hay flujo cifrado, lanza el crack."""
+        if not self.auto_crack or self._crack_running or self.rc4_state is not None:
+            return
+        with self._enc_lock:
+            ready = len(self.send_enc) >= 8
+        if not ready:
+            return
+        self._crack_running = True
+
+        def worker():
+            try:
+                progress = self.on_rc4_progress
+                message = self.find_rc4_state(
+                    progress=(lambda text: progress(text)) if progress else None
+                )
+                if self.on_rc4_result is not None:
+                    self.on_rc4_result(message)
+            except Exception as exc:
+                if self.on_rc4_result is not None:
+                    self.on_rc4_result(f"RC4: {exc}")
+            finally:
+                self._crack_running = False
+
+        threading.Thread(target=worker, name="auto-rc4-crack", daemon=True).start()
+
     def find_rc4_state(self, process=None, progress=None) -> str:
         """Busca la tabla RC4 en la memoria del proceso y la verifica contra
         la salida Send capturada. Aplica el estado si la verificacion cuadra.
@@ -341,9 +448,9 @@ class NpcapCaptureSource:
         `progress(mensaje)` se llama periodicamente con texto de estado.
         Devuelve un mensaje con el resultado; lanza RuntimeError si falla.
         """
-        from .crypto import RC4State
+        from .crypto import RC4State, is_permutation
         from .processio import (
-            kernel32, open_process, read_nearby_bytes, scan_process_permutations,
+            kernel32, open_process, read_process_memory, scan_process_rc4_cells,
         )
 
         target = process or self.rc4_process
@@ -352,8 +459,7 @@ class NpcapCaptureSource:
                 "La captura no tiene proceso asociado (abrela con el proceso "
                 "seleccionado en el dialogo de captura)."
             )
-        raw = bytes(self.rc4_raw)
-        if len(raw) < 12:
+        if len(self.rc4_raw) < 12 and len(self.send_enc) < 6:
             raise RuntimeError(
                 "Aun hay poca salida Send capturada para verificar: espera a "
                 "que el cliente envie paquetes y reintenta."
@@ -363,49 +469,58 @@ class NpcapCaptureSource:
         handle = open_process(target.pid)
         if not handle:
             raise RuntimeError(f"No se pudo abrir el proceso {target.pid}.")
-        best = (0, None)  # (puntuacion, (sbox, i, j, direccion))
-        tail = raw[-2048:]
-        all_candidates = {}
         try:
-            for pass_index in range(4):
-                if progress is not None:
-                    progress(f"Escaneando memoria (pasada {pass_index + 1}/4)...")
-                found = scan_process_permutations(
-                    target,
-                    pass_start=pass_index,
-                    pass_count=1,
-                    max_bytes=256 * 1024 * 1024,
-                    progress=lambda scanned: (
-                        progress(f"Escaneando memoria... {scanned // (1024 * 1024)} MB")
-                        if progress is not None else None
-                    ),
+            # 1) Flujo capturado desde el inicio (tras reconexion): metodo de
+            #    G-Earth. La tabla del cliente Flash son celdas int32.
+            with self._enc_lock:
+                enc = bytes(self.send_enc)
+            if len(enc) < 6:
+                raise RuntimeError(
+                    "No se capturo el inicio del flujo cifrado: reconecta el "
+                    "juego con la captura activa (o deja el modo automatico y "
+                    "espera a que reconecte solo)."
                 )
-                for address, sbox in found:
-                    all_candidates.setdefault(address, sbox)
+            if progress is not None:
+                progress("Buscando la tabla RC4 como celdas int32 (G-Mem)...")
+            tables = scan_process_rc4_cells(
+                target,
+                progress=lambda scanned: (
+                    progress(f"Escaneando memoria... {scanned // (1024 * 1024)} MB")
+                    if progress is not None else None
+                ),
+            )
+            if not tables:
+                raise RuntimeError(
+                    "No se encontro la tabla RC4 (celdas int32) en la memoria "
+                    "del proceso. El cliente puede proteger la memoria."
+                )
+            for index, (address, _sbox) in enumerate(tables):
                 if progress is not None:
                     progress(
-                        f"Verificando {len(all_candidates)} tablas candidatas "
-                        "contra la salida Send..."
+                        f"Probando tabla {index + 1}/{len(tables)} contra "
+                        "los primeros bytes cifrados..."
                     )
-                best = _verify_rc4_candidates(
-                    list(all_candidates.items()), handle, tail, best
-                )
-                if best[0] >= 2:
-                    break
+                window = read_process_memory(handle, address, 1024)
+                sbox = bytes(_sbox)
+                if window and len(window) >= 1024:
+                    low = bytes(window[0:1024:4])
+                    if is_permutation(low):
+                        sbox = low
+                result = _crack_table_from_stream_start(enc, sbox)
+                if result:
+                    i_value, j_value, score = result
+                    self.set_rc4_state(RC4State(sbox, i_value, j_value))
+                    return (
+                        f"Estado RC4 aplicado desde 0x{address:X} "
+                        f"(i={i_value}, j={j_value}, {score} mensajes validos). "
+                        "La salida Send se descifra desde ahora."
+                    )
         finally:
             kernel32.CloseHandle(handle)
-        if best[0] < 1 or best[1] is None:
-            raise RuntimeError(
-                f"Se hallaron {len(all_candidates)} tablas RC4 pero ninguna "
-                f"descifro la salida Send (mejor puntuacion {best[0]}). "
-                "El juego puede re-inicializar el cifrado por paquete o "
-                "proteger la memoria."
-            )
-        sbox, i_value, j_value, address = best[1]
-        self.set_rc4_state(RC4State(sbox, i_value, j_value))
-        return (
-            f"Estado RC4 aplicado desde 0x{address:X} (i={i_value}, j={j_value}, "
-            f"{best[0]} mensajes validos). La salida Send se descifra desde ahora."
+        raise RuntimeError(
+            f"Se hallaron {len(tables)} tablas RC4 pero ninguna descifro el "
+            "inicio del flujo cifrado. El juego puede re-inicializar el "
+            "cifrado por conexion o la tabla cambia de sitio constantemente."
         )
 
 

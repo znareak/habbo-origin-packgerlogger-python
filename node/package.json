@@ -1,0 +1,9 @@
+{
+  "name": "node-packetlogger",
+  "version": "1.0.0",
+  "description": "Detector de paquetes Send/Recv por terminal (Npcap) — version resumida del Packet Logger de Python",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  }
+}

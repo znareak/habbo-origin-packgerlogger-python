@@ -1,0 +1,8 @@
+{
+  "name": "Ejemplo: HTTP",
+  "filters": [
+    { "direction": "Recv", "header": "HTTP/", "contains": "", "regex": "" },
+    { "direction": "Send", "header": "GET ", "contains": "", "regex": "" },
+    { "direction": "Send", "header": "POST ", "contains": "", "regex": "" }
+  ]
+}

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import ctypes
 import socket as _socket
+import threading
+import time
 from ctypes import wintypes
 from typing import List, Optional, Tuple
 
@@ -430,19 +432,51 @@ class SocketInjector:
         self.process_handle: Optional[wintypes.HANDLE] = None
         self.socket_handle: Optional[wintypes.HANDLE] = None
         self.remote: Optional[Tuple[str, int]] = None
+        # Reconexion automatica (los juegos cambian de conexion a menudo)
+        self._target: Optional[Tuple[str, int]] = None
+        self._reconnect_thread: Optional[threading.Thread] = None
+        self._reconnect_stop = threading.Event()
+        self._reconnect_wake = threading.Event()
+        self._reconnect_interval = 5.0
+        self._reconnect_callback = None
 
     def connect(
         self,
         ports: Optional[Tuple[int, ...]] = None,
         target: Optional[Tuple[str, int]] = None,
+        retries: int = 3,
+        retry_delay: float = 0.8,
     ) -> bool:
         """Duplica el socket de una conexion TCP del proceso.
 
         ports:  tupla de puertos remotos permitidos (None = cualquiera).
         target: (ip, puerto) remoto concreto que debe coincidir.
+        retries: reintentos extra si la conexion no aparece o desaparece
+                 (algunos juegos reconectan con frecuencia).
 
         Devuelve True si se conecto; lanza RuntimeError con el detalle si falla.
         """
+        if target is not None:
+            self._target = target
+        attempts = max(1, retries + 1)
+        last_error: Optional[RuntimeError] = None
+        for attempt in range(attempts):
+            try:
+                self._connect_once(ports, target)
+                return True
+            except RuntimeError as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(retry_delay)
+        assert last_error is not None
+        raise last_error
+
+    def _connect_once(
+        self,
+        ports: Optional[Tuple[int, ...]] = None,
+        target: Optional[Tuple[str, int]] = None,
+    ) -> None:
+        """Un unico intento de duplicar el socket (sin reintentos)."""
         self.close()
         try:
             self.process_handle = open_process(self.pid)
@@ -503,7 +537,7 @@ class SocketInjector:
             checked += 1
             try:
                 if try_socket(duplicated):
-                    return True
+                    return
                 kernel32.CloseHandle(duplicated)
             except OSError:
                 pass
@@ -517,7 +551,7 @@ class SocketInjector:
                 checked += 1
                 try:
                     if try_socket(duplicated):
-                        return True
+                        return
                     kernel32.CloseHandle(duplicated)
                 except OSError:
                     pass
@@ -572,6 +606,7 @@ class SocketInjector:
         try:
             sent = send_on_socket(self.socket_handle, data)
         except OSError as exc:
+            self._reconnect_wake.set()
             raise RuntimeError(
                 f"send() fallo (error Winsock {exc.errno}: {exc.strerror}). "
                 "La conexion puede haberse cerrado o el proceso cerro el socket."
@@ -579,6 +614,57 @@ class SocketInjector:
         if sent != len(data):
             raise RuntimeError(f"send() incompleto: {sent}/{len(data)} bytes")
         return sent
+
+    def start_auto_reconnect(self, interval: float = 5.0, callback=None) -> None:
+        """Revisa cada `interval` segundos si la conexion sigue viva y reconecta.
+
+        callback(injector) se invoca (desde el hilo) tras reconectar con exito.
+        """
+        self._reconnect_interval = max(1.0, interval)
+        self._reconnect_callback = callback
+        self._reconnect_stop.clear()
+        self._reconnect_wake.clear()
+        if self._reconnect_thread is None or not self._reconnect_thread.is_alive():
+            self._reconnect_thread = threading.Thread(
+                target=self._auto_reconnect_loop, name="auto-reconnect", daemon=True
+            )
+            self._reconnect_thread.start()
+
+    def stop_auto_reconnect(self) -> None:
+        self._reconnect_stop.set()
+        self._reconnect_wake.set()
+
+    def _auto_reconnect_loop(self) -> None:
+        while not self._reconnect_stop.is_set():
+            self._reconnect_wake.wait(self._reconnect_interval)
+            self._reconnect_wake.clear()
+            if self._reconnect_stop.is_set():
+                break
+            if self._connection_alive():
+                continue
+            try:
+                self.connect(target=self._target, retries=3, retry_delay=1.5)
+            except RuntimeError:
+                self.close()
+                continue
+            callback = self._reconnect_callback
+            if callback is not None:
+                try:
+                    callback(self)
+                except Exception:
+                    pass
+
+    def _connection_alive(self) -> bool:
+        """Comprueba (via psutil, sin tocar el socket) si la conexion sigue."""
+        if self.remote is None:
+            return False
+        try:
+            connections = find_tcp_connections(self.process, (self.remote[1],))
+        except Exception:
+            return False
+        return any(
+            connection.get("remote_ip") == self.remote[0] for connection in connections
+        )
 
     def close(self) -> None:
         for handle in (self.socket_handle, self.process_handle):

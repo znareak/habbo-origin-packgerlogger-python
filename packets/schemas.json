@@ -1,0 +1,30 @@
+{
+  "143": {
+    "name": "RequestUserClub",
+    "fields": ["s"]
+  },
+  "220": {
+    "name": "UserClub",
+    "fields": ["s", "i", "i", "i", "b", "b", "i", "i", "i", "i"]
+  },
+  "417": {
+    "name": "LatencyTest",
+    "fields": ["i"]
+  },
+  "687": {
+    "name": "",
+    "fields": ["i", "i", "i"]
+  },
+  "2430": {
+    "name": "",
+    "fields": ["i"]
+  },
+  "3099": {
+    "name": "",
+    "fields": ["i"]
+  },
+  "1716": {
+    "name": "FurniListRemoveEvent",
+    "fields": ["i"]
+  }
+}

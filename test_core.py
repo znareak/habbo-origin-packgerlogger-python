@@ -88,13 +88,70 @@ assert extract_binary_frames(buffer) == [(10, (3).to_bytes(4, "big") + b"ab12345
 tokens = parse_binary_tokens((2).to_bytes(4, "big") + (5).to_bytes(2, "big") + b"hello")
 assert tokens == [("i", 2), ("s", "hello")]
 assert format_binary_message("Recv", 2430, (2).to_bytes(4, "big")) == "Incoming [2430] i:2"
+
+# Par de bytes 01 01: deben leerse como dos booleanos, no como h:257
+body = bytes([1, 1, 0, 0, 0, 0, 0, 0, 0, 20])
+assert parse_binary_tokens(body) == [("b", True), ("b", True), ("i", 0), ("i", 20)], parse_binary_tokens(body)
+
+# Esquema de campos por cabecera (define exactamente los tipos del cuerpo)
+from app.capture import PACKET_SCHEMAS
+
+PACKET_SCHEMAS[220] = {
+    "name": "UserClub",
+    "fields": ["s", "i", "i", "i", "b", "b", "i", "i", "i", "i"],
+}
+club_body = bytes.fromhex(
+    "000a636c75625f686162626f"
+    "0000001300000000000000010101"
+    "000000000000001400006f2a00003f35"
+)
+msg = format_binary_message("Recv", 220, club_body)
+expected = (
+    'Incoming [220 UserClub] s:"club_habbo" i:19 i:0 i:1 b:true b:true '
+    "i:0 i:20 i:28458 i:16181"
+)
+assert msg == expected, msg
+PACKET_SCHEMAS.pop(220, None)
+
+# Los enteros se muestran con signo (como G-Earth/xabbo): ff ff ff ff -> i:-1
+PACKET_SCHEMAS[9999] = {"name": "ConSigno", "fields": ["i", "l"]}
+neg_body = (-1).to_bytes(4, "big", signed=True) + (-2).to_bytes(8, "big", signed=True)
+assert (
+    format_binary_message("Recv", 9999, neg_body)
+    == "Incoming [9999 ConSigno] i:-1 l:-2"
+), format_binary_message("Recv", 9999, neg_body)
+PACKET_SCHEMAS.pop(9999, None)
+
+# Formato legacy de bytes estilo G-Earth (longitud + header + datos byte a byte)
+from app.capture import format_legacy_packet
+
+chat_body = (0).to_bytes(4, "big") + (12).to_bytes(2, "big") + b"Hello, world" + bytes(16)
+legacy_expected = "Incoming[1064] -> [0][0][0]$[4]([0][0][0][0][0][12]Hello, world" + "[0]" * 16
+assert format_legacy_packet("Recv", 1064, chat_body) == legacy_expected, format_legacy_packet("Recv", 1064, chat_body)
+
+# Ejemplo del foro de Ragezone: 00 00 00 06 06 b4 b3 7d a9 c6
+# -> longitud 6, header 1716, entero con signo -1283610170
+rage_frame = extract_binary_frames(bytearray(bytes.fromhex("0000000606b4b37da9c6")))
+assert rage_frame == [(1716, bytes.fromhex("b37da9c6"))], rage_frame
+assert (
+    format_binary_message("Recv", 7777, bytes.fromhex("b37da9c6"))
+    == "Incoming [7777] i:-1283610170"
+), format_binary_message("Recv", 7777, bytes.fromhex("b37da9c6"))
+PACKET_SCHEMAS[1716] = {"name": "FurniListRemoveEvent", "fields": ["i"]}
+assert (
+    format_binary_message("Recv", 1716, rage_frame[0][1])
+    == "Incoming [1716 FurniListRemoveEvent] i:-1283610170"
+)
+PACKET_SCHEMAS.pop(1716, None)
 print("binary OK")
 
 # 7. Codificador binario (framing para envio)
 message = encode_binary_message('143 s:"hello_world" i:19 b:true u:0xFF')
 frames = extract_binary_frames(bytearray(message))
 assert frames == [(143, (11).to_bytes(2, "big") + b"hello_world" + (19).to_bytes(4, "big") + b"\x01\xff")]
-assert format_binary_message("Send", frames[0][0], frames[0][1]).startswith("Outgoing [143]")
+assert format_binary_message("Send", frames[0][0], frames[0][1]).startswith("Outgoing [143")
+long_msg = encode_binary_message("5 l:-7")
+assert extract_binary_frames(bytearray(long_msg)) == [(5, (-7).to_bytes(8, "big", signed=True))]
 print("binary encode OK")
 
 # 8. Inyector: prueba local de extremo a extremo (socket duplicado + send)

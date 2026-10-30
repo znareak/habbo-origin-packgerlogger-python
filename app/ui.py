@@ -11,13 +11,14 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
 
-from .capture import NpcapCaptureSource, encode_binary_message
+from .capture import PACKET_SCHEMAS, NpcapCaptureSource, encode_binary_message, save_packet_schema
 from .filesource import FilePacketSource, FileReplayer
 from .filters import PacketFilter, ProfileStore
 from .models import Packet
@@ -83,6 +84,23 @@ def pick_mono_font(root, size: int = 9):
     return ("Consolas", size)
 
 
+def parse_hex_packet(text: str) -> "bytes | None":
+    """Convierte un texto de bytes hex (p. ej. '1a 81 7a fa') en bytes crudos.
+
+    Devuelve None si el texto no parece una secuencia hex valida.
+    """
+    tokens = text.split()
+    if not tokens:
+        return None
+    hex_chars = set("0123456789abcdefABCDEF")
+    if not all(len(token) <= 2 and all(ch in hex_chars for ch in token) for token in tokens):
+        return None
+    try:
+        return bytes.fromhex("".join(tokens))
+    except ValueError:
+        return None
+
+
 def center_window(window: tk.Toplevel) -> None:
     """Centra una ventana en la pantalla manteniendo su tamano."""
     try:
@@ -107,10 +125,11 @@ class PacketGrid(ttk.Frame):
     (la tabla puede recortarlo visualmente) y opciones de copiado.
     """
 
-    def __init__(self, master, on_select=None, on_send_packet=None):
+    def __init__(self, master, on_select=None, on_send_packet=None, on_define_schema=None):
         super().__init__(master)
         self.columns = ("time", "dir", "data")
         self._on_send_packet = on_send_packet
+        self._on_define_schema = on_define_schema
         # Tema oscuro para la lista de paquetes (estilo consola)
         mono_font = pick_mono_font(self)
         style = ttk.Style(self)
@@ -200,6 +219,9 @@ class PacketGrid(ttk.Frame):
         if self._on_send_packet is not None:
             self._menu.add_separator()
             self._menu.add_command(label="Enviar paquete", command=self._send_selected)
+        if self._on_define_schema is not None:
+            self._menu.add_separator()
+            self._menu.add_command(label="Definir estructura...", command=self._open_define_schema)
         self._menu.add_separator()
         self._menu.add_command(label="Limpiar pantalla", command=self.clear)
         self.tree.bind("<Button-3>", self._on_right_click)
@@ -214,6 +236,12 @@ class PacketGrid(ttk.Frame):
         packet = self.selected()
         if packet is not None and self._on_send_packet is not None:
             self._on_send_packet(packet)
+
+    def _open_define_schema(self) -> None:
+        """Abre el editor de estructura para el paquete seleccionado."""
+        packet = self.selected()
+        if packet is not None and self._on_define_schema is not None:
+            self._on_define_schema(packet)
 
     def _on_tree_select(self, _event=None) -> None:
         packet = self.selected()
@@ -450,17 +478,25 @@ class SourceTab(ttk.Frame):
             toolbar, text="Auto-scroll", variable=self.autoscroll_var
         ).pack(side="left")
         self.decode_var = tk.BooleanVar(value=False)
+        self.legacy_var = tk.BooleanVar(value=False)
         if isinstance(source, NpcapCaptureSource):
             ttk.Checkbutton(
                 toolbar, text="Decodificar", variable=self.decode_var, command=self._toggle_decode
             ).pack(side="left", padx=4)
+            ttk.Checkbutton(
+                toolbar, text="Bytes (G-Earth)", variable=self.legacy_var, command=self._toggle_legacy
+            ).pack(side="left")
         self.status_var = tk.StringVar(value="Detenido")
         ttk.Label(toolbar, textvariable=self.status_var, foreground="#9a9a9a").pack(side="right")
 
         self.filter_bar = FilterBar(self, profile_store, on_change=self._apply_filter)
         self.filter_bar.pack(fill="x", padx=8, pady=6)
 
-        self.grid = PacketGrid(self, on_send_packet=self._send_packet_from_grid)
+        self.grid = PacketGrid(
+            self,
+            on_send_packet=self._send_packet_from_grid,
+            on_define_schema=self._open_schema_editor,
+        )
         self.grid.pack(fill="both", expand=True, padx=8, pady=6)
 
         self.send_panel = SendPanel(self, on_send=self._send, injectors_provider=self._injector_options)
@@ -563,6 +599,16 @@ class SourceTab(ttk.Frame):
                 else "Decodificacion binaria desactivada"
             )
 
+    def _toggle_legacy(self) -> None:
+        """Muestra los mensajes decodificados en el formato legacy de bytes (G-Earth)."""
+        if isinstance(self.source, NpcapCaptureSource):
+            self.source.legacy_format = self.legacy_var.get()
+            self.status_var.set(
+                "Formato bytes (G-Earth) activado"
+                if self.legacy_var.get()
+                else "Formato expresion activado"
+            )
+
     # -- cola de paquetes ------------------------------------------------
 
     def _poll_queue(self) -> None:
@@ -599,6 +645,25 @@ class SourceTab(ttk.Frame):
             return
         self.grid.add(packet, autoscroll=self.autoscroll_var.get())
 
+    # -- estructuras de paquete ------------------------------------------
+
+    def _open_schema_editor(self, packet: Packet) -> None:
+        match = re.match(r"^(?:Incoming|Outgoing) \[(\d+)(?: [^\]]*)?\]", packet.data)
+        if match is None:
+            self.status_var.set(
+                "Ese paquete no es un mensaje decodificado: activa 'Decodificar' y "
+                "elige un paquete Incoming/Outgoing."
+            )
+            return
+        header = int(match.group(1))
+        SchemaDialog(self, header, on_save=self._on_schema_saved)
+
+    def _on_schema_saved(self, header: int) -> None:
+        self.status_var.set(
+            f"Estructura guardada para la cabecera {header}; se aplica a los "
+            "proximos paquetes capturados."
+        )
+
     # -- envio / inyeccion -----------------------------------------------
 
     def _injector_options(self):
@@ -633,7 +698,12 @@ class SourceTab(ttk.Frame):
 
         payload: "str | bytes" = text
         hint = ""
-        if isinstance(self.source, NpcapCaptureSource) and self.decode_var.get():
+        raw_hex = parse_hex_packet(text)
+        if raw_hex:
+            # Hex crudo: reenviar exactamente esos bytes (p. ej. un paquete capturado)
+            payload = raw_hex
+            hint = " (hex crudo)"
+        elif isinstance(self.source, NpcapCaptureSource) and self.decode_var.get():
             # Con la decodificacion activa, construir el framing binario del mensaje
             try:
                 payload = encode_binary_message(text)
@@ -641,6 +711,8 @@ class SourceTab(ttk.Frame):
             except ValueError as exc:
                 self._report_error(f"Error en el paquete binario: {exc}")
                 return
+        else:
+            payload = text
 
         def worker():
             with self._send_lock:
@@ -1034,7 +1106,8 @@ class InjectorDialog(tk.Toplevel):
         ttk.Label(
             body,
             text="El texto se envia tal cual (sin cifrar). La inyeccion requiere\n"
-            "ejecutar el programa como Administrador.",
+            "ejecutar el programa como Administrador. Se reconecta solo si\n"
+            "el programa cambia de conexion.",
             foreground="#666",
         ).grid(row=3, column=0, columnspan=2, sticky="w")
 
@@ -1046,6 +1119,8 @@ class InjectorDialog(tk.Toplevel):
         self._refresh_processes()
         self.grab_set()
         center_window(self)
+        self._auto_refresh_id: Optional[str] = None
+        self._schedule_auto_refresh()
 
     def _refresh_processes(self) -> None:
         current = self.proc_var.get()
@@ -1077,6 +1152,11 @@ class InjectorDialog(tk.Toplevel):
 
     def _load_connections(self, _event=None) -> None:
         process = self._selected_process()
+        previous_label = None
+        selection = self.conn_list.curselection()
+        if selection and selection[0] > 0 and selection[0] - 1 < len(self.connections):
+            previous = self.connections[selection[0] - 1]
+            previous_label = f"{previous['remote_ip']}:{previous['remote_port']}"
         self.connections = []
         self.conn_list.delete(0, "end")
         if process is None:
@@ -1097,8 +1177,32 @@ class InjectorDialog(tk.Toplevel):
             if connection is best:
                 label += "  <- recomendada"
             self.conn_list.insert("end", label)
+        # Conservar la seleccion del usuario si la conexion sigue existiendo
+        if previous_label is not None:
+            for index, connection in enumerate(self.connections):
+                current = f"{connection['remote_ip']}:{connection['remote_port']}"
+                if current == previous_label:
+                    self.conn_list.selection_set(index + 1)
+                    return
         if best is not None:
             self.conn_list.selection_set(connections.index(best) + 1)
+
+    def _schedule_auto_refresh(self) -> None:
+        """Refresca la lista de conexiones cada 2 s mientras el dialogo este abierto."""
+        try:
+            self._auto_refresh_id = self.after(2000, self._auto_refresh_connections)
+        except tk.TclError:
+            pass
+
+    def _auto_refresh_connections(self) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+            if self._selected_process() is not None:
+                self._load_connections()
+        except tk.TclError:
+            return
+        self._schedule_auto_refresh()
 
     def _selected_connection(self):
         selection = self.conn_list.curselection()
@@ -1118,6 +1222,76 @@ class InjectorDialog(tk.Toplevel):
             "process": process,
             "connection": self._selected_connection(),
         }
+        self.destroy()
+
+
+class SchemaDialog(tk.Toplevel):
+    """Editor de la estructura de campos de una cabecera de paquete."""
+
+    def __init__(self, master, header: int, on_save=None):
+        super().__init__(master)
+        self.title("Definir estructura de paquete")
+        self.resizable(False, False)
+        self.configure(bg=DARK_BG)
+        self.header = header
+        self._on_save = on_save
+
+        body = ttk.Frame(self, padding=14)
+        body.grid(row=0, column=0, sticky="nsew")
+
+        ttk.Label(body, text=f"Cabecera: {header}").grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        ttk.Label(body, text="Nombre (opcional):").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        existing = PACKET_SCHEMAS.get(header)
+        self.name_var = tk.StringVar(value=(existing or {}).get("name", ""))
+        ttk.Entry(body, textvariable=self.name_var, width=38).grid(
+            row=1, column=1, sticky="we", pady=(8, 0)
+        )
+        ttk.Label(body, text="Campos:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.fields_var = tk.StringVar(
+            value=" ".join((existing or {}).get("fields", []))
+        )
+        ttk.Entry(body, textvariable=self.fields_var, width=38).grid(
+            row=2, column=1, sticky="we", pady=(8, 0)
+        )
+        ttk.Label(
+            body,
+            text="Tipos separados por espacios:\n"
+            "  i = entero 4 bytes    h = entero 2 bytes\n"
+            "  s = cadena (longitud + texto)    b = booleano (1 byte)\n"
+            "  u = byte suelto    l = entero 8 bytes\n"
+            "Ejemplo: s i i b b i i",
+            foreground="#666",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=4, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(buttons, text="Guardar", command=self._save).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Cancelar", command=self.destroy).pack(side="left")
+
+        self.grab_set()
+        center_window(self)
+
+    def _save(self) -> None:
+        fields = [field.strip().lower() for field in self.fields_var.get().split() if field.strip()]
+        if not fields:
+            messagebox.showwarning(
+                "Estructura", "Escribe al menos un tipo de campo.", parent=self
+            )
+            return
+        allowed = set("ihsbu")
+        for field in fields:
+            if field not in allowed:
+                messagebox.showwarning(
+                    "Estructura",
+                    f"Tipo desconocido: '{field}'. Usa i, h, s, b o u.",
+                    parent=self,
+                )
+                return
+        save_packet_schema(self.header, self.name_var.get(), fields)
+        if self._on_save is not None:
+            self._on_save(self.header)
         self.destroy()
 
 
@@ -1545,11 +1719,16 @@ class App(tk.Tk):
             return
         injector = SocketInjector(process)
         try:
-            injector.connect(target=(entry["remote_ip"], entry["remote_port"]))
+            injector.connect(
+                target=(entry["remote_ip"], entry["remote_port"]),
+                retries=3,
+                retry_delay=0.8,
+            )
         except RuntimeError as exc:
             messagebox.showerror("Inyector", str(exc), parent=self)
             injector.close()
             return
+        injector.start_auto_reconnect(interval=4.0, callback=self._on_injector_reconnect)
         self.injectors.append(injector)
         self._refresh_all_send_panels()
         self.status_text.set(f"Inyector conectado a {injector.remote}")
@@ -1678,11 +1857,12 @@ class App(tk.Tk):
             ports = (connection["remote_port"],)
             target = (connection["remote_ip"], connection["remote_port"])
         try:
-            injector.connect(ports=ports, target=target)
+            injector.connect(ports=ports, target=target, retries=3, retry_delay=0.8)
         except RuntimeError as exc:
             messagebox.showerror("Inyector", str(exc), parent=self)
             injector.close()
             return
+        injector.start_auto_reconnect(interval=4.0, callback=self._on_injector_reconnect)
         self.injectors.append(injector)
         self._refresh_all_send_panels()
         self.status_text.set(f"Inyector conectado a {injector.remote}")
@@ -1690,9 +1870,27 @@ class App(tk.Tk):
 
     def _close_injectors(self) -> None:
         for injector in self.injectors:
+            injector.stop_auto_reconnect()
             injector.close()
         self.injectors.clear()
         self._refresh_all_send_panels()
+
+    def _on_injector_reconnect(self, injector: SocketInjector) -> None:
+        """Se llama desde el hilo de reconexion automatica tras reconectar."""
+        try:
+            self.after(0, lambda: self._injector_reconnected(injector))
+        except tk.TclError:
+            pass
+
+    def _injector_reconnected(self, injector: SocketInjector) -> None:
+        if not any(item is injector for item in self.injectors):
+            return
+        self._refresh_all_send_panels()
+        remote = injector.remote
+        if remote:
+            self.status_text.set(
+                f"Inyector reconectado a {injector.name} {remote[0]}:{remote[1]}"
+            )
 
     def _refresh_all_send_panels(self) -> None:
         for widget in self._all_tabs():

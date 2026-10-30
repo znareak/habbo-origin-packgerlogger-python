@@ -11,9 +11,11 @@ Notas: requiere Npcap instalado y permisos de Administrador. El trafico cifrado
 """
 from __future__ import annotations
 
+import json
+import os
 import queue
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import psutil
 from scapy.all import AsyncSniffer, Raw, TCP, UDP, conf
@@ -57,6 +59,8 @@ class NpcapCaptureSource:
         self._sniffer: Optional[AsyncSniffer] = None
         # Modo de decodificacion binaria (activado desde la interfaz)
         self.binary_decode = False
+        # Mostrar los mensajes decodificados en el formato legacy de bytes (G-Earth)
+        self.legacy_format = False
         self._binary_streams = {"Send": bytearray(), "Recv": bytearray()}
         self._binary_framed = {"Send": False, "Recv": False}
 
@@ -171,9 +175,11 @@ class NpcapCaptureSource:
                     break
                 self._binary_framed[direction] = True
                 for header, body in frames:
-                    self._emit_packet(
-                        direction, format_binary_message(direction, header, body)
-                    )
+                    if self.legacy_format:
+                        text = format_legacy_packet(direction, header, body)
+                    else:
+                        text = format_binary_message(direction, header, body)
+                    self._emit_packet(direction, text)
             return
 
         self._emit_packet(direction, decode_payload(payload))
@@ -231,7 +237,60 @@ class NpcapCaptureSource:
 # (cadenas con prefijo de longitud, enteros, booleanos).
 
 BINARY_MAX_MESSAGE_LENGTH = 1 << 20  # 1 MB: si se supera, el flujo se desincronizo
+# ---------------------------------------------------------------------------
+# Esquemas de paquetes (estructura de campos por cabecera)
+# ---------------------------------------------------------------------------
+#
+# `packets/schemas.json` define, para cada cabecera numerica, el nombre y los
+# tipos de los campos del cuerpo: "i" int32, "h" int16, "s" cadena (longitud
+# int16 BE + bytes), "b" booleano, "u" byte. Sin esquema se usa la heuristica.
 
+PACKETS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packets"
+)
+PACKET_SCHEMAS: "dict[int, dict]" = {}
+
+
+def load_packet_schemas() -> "dict[int, dict]":
+    """Carga packets/schemas.json en PACKET_SCHEMAS (cabecera -> {name, fields})."""
+    PACKET_SCHEMAS.clear()
+    path = os.path.join(PACKETS_DIR, "schemas.json")
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (OSError, ValueError):
+        return PACKET_SCHEMAS
+    for key, value in data.items():
+        try:
+            header = int(key, 0)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        name = str(value.get("name", "")).strip()
+        fields = value.get("fields")
+        if isinstance(fields, list) and all(isinstance(field, str) for field in fields):
+            PACKET_SCHEMAS[header] = {"name": name, "fields": fields}
+    return PACKET_SCHEMAS
+
+
+def save_packet_schema(header: int, name: str, fields: List[str]) -> dict:
+    """Añade o actualiza la estructura de una cabecera y la guarda en disco."""
+    entry = {"name": name.strip(), "fields": fields}
+    PACKET_SCHEMAS[header] = entry
+    path = os.path.join(PACKETS_DIR, "schemas.json")
+    os.makedirs(PACKETS_DIR, exist_ok=True)
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, ValueError):
+            data = {}
+    data[str(header)] = entry
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2, ensure_ascii=False)
+    return entry
 
 def extract_binary_frames(buffer: bytearray):
     """Extrae mensajes completos de un buffer TCP y los consume.
@@ -285,36 +344,129 @@ def parse_binary_tokens(body: bytes):
                     continue
         # 2) Entero int32 BE con bytes altos a cero (valores pequenos tipicos)
         if index + 4 <= size and body[index] == 0 and body[index + 1] == 0:
-            tokens.append(("i", int.from_bytes(body[index:index + 4], "big")))
+            tokens.append(("i", int.from_bytes(body[index:index + 4], "big", signed=True)))
             index += 4
             continue
-        # 3) Corto int16 BE
+        # 3) Byte booleano cuando el par de bytes siguiente es 0/1: evita que
+        #    secuencias como `01 01` se lean como un corto h:257
+        if index + 1 < size and body[index] in (0, 1) and body[index + 1] in (0, 1):
+            tokens.append(("b", body[index] == 1))
+            index += 1
+            continue
+        # 4) Si quedan exactamente 4 bytes, son un unico int32 BE (puede ser
+        #    negativo), p. ej. `b3 7d a9 c6` -> i:-1282971706
+        if index + 4 == size:
+            tokens.append(("i", int.from_bytes(body[index:index + 4], "big", signed=True)))
+            index += 4
+            continue
+        # 5) Corto int16 BE
         if index + 2 <= size:
             tokens.append(("h", int.from_bytes(body[index:index + 2], "big")))
             index += 2
             continue
-        # 4) Byte suelto (booleano o crudo)
+        # 6) Byte suelto (booleano o crudo)
         byte = body[index]
         index += 1
         tokens.append(("b", byte == 1) if byte in (0, 1) else ("u", byte))
     return tokens
 
 
+def _parse_with_schema(body: bytes, fields: List[str]):
+    """Parsea el cuerpo siguiendo los tipos exactos del esquema."""
+    tokens = []
+    index = 0
+    for field in fields:
+        if index >= len(body):
+            break
+        kind = field.lower()
+        try:
+            if kind == "i":
+                if index + 4 > len(body):
+                    break
+                tokens.append(("i", int.from_bytes(body[index:index + 4], "big", signed=True)))
+                index += 4
+            elif kind == "l":
+                if index + 8 > len(body):
+                    break
+                tokens.append(("l", int.from_bytes(body[index:index + 8], "big", signed=True)))
+                index += 8
+            elif kind == "h":
+                if index + 2 > len(body):
+                    break
+                tokens.append(("h", int.from_bytes(body[index:index + 2], "big")))
+                index += 2
+            elif kind == "s":
+                if index + 2 > len(body):
+                    break
+                length = int.from_bytes(body[index:index + 2], "big")
+                if index + 2 + length > len(body):
+                    break
+                chunk = body[index + 2:index + 2 + length]
+                tokens.append(("s", chunk.decode("utf-8", "replace")))
+                index += 2 + length
+            elif kind == "b":
+                tokens.append(("b", body[index] == 1))
+                index += 1
+            else:
+                tokens.append(("u", body[index]))
+                index += 1
+        except Exception:
+            tokens.append(("u", body[index]))
+            index += 1
+    # Bytes restantes sin cubrir por el esquema: continuar con la heuristica
+    if index < len(body):
+        tokens.extend(parse_binary_tokens(body[index:]))
+    return tokens
+
+
+def format_legacy_packet(direction: str, header: int, body: bytes) -> str:
+    """Formatea un mensaje en el formato legacy de bytes estilo G-Earth.
+
+    Muestra el paquete completo (longitud + header + datos) byte a byte:
+    cada byte imprimible como su caracter (latin-1) y el resto como [valor],
+    p. ej. `Incoming[1064] -> [0][0][0]$[4]([0][0][0][0][0][12]Hello, world...`.
+    Los corchetes y llaves se muestran como [91]/[93]/[123]/[125] para evitar
+    ambiguedades, igual que en G-Earth.
+    """
+    length = 2 + len(body)
+    payload = length.to_bytes(4, "big") + header.to_bytes(2, "big") + body
+    parts = []
+    for byte in payload:
+        char = byte.to_bytes(1, "big").decode("latin-1")
+        if char in "[]{}" or not char.isprintable():
+            parts.append(f"[{byte}]")
+        else:
+            parts.append(char)
+    side = "Incoming" if direction == "Recv" else "Outgoing"
+    return f"{side}[{header}] -> {''.join(parts)}"
+
+
 def format_binary_message(direction: str, header: int, body: bytes) -> str:
     """Formatea un mensaje binario para mostrarlo en el logger."""
+    schema = PACKET_SCHEMAS.get(header)
     if body:
-        tokens = " ".join(_format_binary_token(token) for token in parse_binary_tokens(body))
+        if schema is not None:
+            tokens = " ".join(
+                _format_binary_token(token)
+                for token in _parse_with_schema(body, schema["fields"])
+            )
+        else:
+            tokens = " ".join(
+                _format_binary_token(token) for token in parse_binary_tokens(body)
+            )
     else:
         tokens = "(vacio)"
     side = "Incoming" if direction == "Recv" else "Outgoing"
-    return f"{side} [{header}] {tokens}"
+    name = f" {schema['name']}" if schema and schema.get("name") else ""
+    return f"{side} [{header}{name}] {tokens}"
 
 
 def encode_binary_message(text: str) -> bytes:
     """Construye un mensaje binario completo a partir de texto.
 
     Formato: "<header> <token> <token> ..." donde cada token es:
-      i:123      entero int32 big-endian
+      i:123      entero int32 big-endian (con signo)
+      l:123      entero int64 big-endian (con signo)
       h:123      corto int16 big-endian
       s:"texto"  cadena (longitud int16 BE + bytes UTF-8)
       b:true     booleano (true/false/1/0)
@@ -337,6 +489,8 @@ def encode_binary_message(text: str) -> bytes:
         try:
             if kind == "i":
                 body += int(value, 0).to_bytes(4, "big", signed=True)
+            elif kind == "l":
+                body += int(value, 0).to_bytes(8, "big", signed=True)
             elif kind == "h":
                 body += int(value, 0).to_bytes(2, "big", signed=True)
             elif kind == "s":

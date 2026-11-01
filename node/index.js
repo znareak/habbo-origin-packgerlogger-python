@@ -1,5 +1,8 @@
 const { spawn, spawnSync, execFileSync } = require("child_process");
 const readline = require("readline");
+const fs = require("fs");
+const path = require("path");
+const buildSnifferScript = require("./shell");
 
 const CLEAR = "\x1b[2J\x1b[0;0H";
 
@@ -14,6 +17,8 @@ try {
 
 function parseAddress(text) {
   if (!text) return null;
+  if (text === "*:*") return { ip: "*", port: 0 };
+
   const match = text.match(/^\[?([^\]]+)\]?:(\d+)$/);
   if (!match) return null;
 
@@ -62,9 +67,11 @@ function loadConnections() {
     const pid = parseInt(proto === "TCP" ? parts[4] : parts[3], 10);
 
     if (!local || !remote || !pid) continue;
+    if (proto === "TCP" && remote.port === 0) continue;
+    if (proto === "UDP" && (local.ip.includes(":") || local.port === 0)) continue;
 
     const name = processNames.get(pid) || `(pid ${pid})`;
-    const uniqueKey = `${name}|${proto}|${remote.ip}:${remote.port}`;
+    const uniqueKey = `${name}|${proto}|${local.port}|${remote.ip}:${remote.port}`;
 
     if (!seen.has(uniqueKey)) {
       seen.add(uniqueKey);
@@ -72,7 +79,7 @@ function loadConnections() {
         proto: proto.toLowerCase(),
         pid,
         name,
-        localIp: local.ip,
+        localIp: local.ip === "0.0.0.0" ? "" : local.ip,
         localPort: local.port,
         remoteIp: remote.ip,
         remotePort: remote.port,
@@ -80,7 +87,7 @@ function loadConnections() {
     }
   }
 
-  return connections.sort((a, b) => a.name.localeCompare(b.name) || a.remotePort - b.remotePort);
+  return connections.sort((a, b) => a.name.localeCompare(b.name) || a.localPort - b.localPort);
 }
 
 function groupByProcess(connections) {
@@ -230,290 +237,136 @@ function startCapture(connection, ifaceArg) {
     process.exit(0);
   }
 
-  if (nativeModule) {
-    runNative(connection, ifaceArg);
-  } else {
-    runPowershellEngine(connection);
-  }
+  runPowershellEngine(connection);
 }
 
-// ---------- Motor 1: Módulo nativo 'cap' ----------------------------------
+// ---------- Parseo de comandos de envío de paquetes ------------------------
 
-function runNative(connection, ifaceArg) {
-  const { Cap, decoders } = nativeModule;
-  const { Ethernet, IPV4, IPV6, TCP, UDP, PROTOCOL } = decoders;
-  const { proto, remoteIp: host, remotePort: port } = connection;
+function parseUserPacketInput(input) {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
 
-  const devices = Cap.deviceList();
-  const chosenDevice = ifaceArg
-    ? devices.find((d) => d.name === ifaceArg)
-    : devices.find((d) => (d.addresses || []).some((a) => a.addr && !a.addr.includes(":"))) ||
-      devices[0];
-
-  if (!chosenDevice) {
-    console.error("No se encontro ninguna interfaz con Npcap.");
-    process.exit(1);
+  if (trimmed.toLowerCase().startsWith("ascii ")) {
+    return Buffer.from(trimmed.slice(6), "latin1");
   }
 
-  const filter = `${proto} and host ${host} and port ${port}`;
-  console.log(`[*] Interfaz: ${chosenDevice.name}`);
-  console.log(`[*] Filtro: ${filter}`);
-  console.log("[*] Capturando (Ctrl+C para salir)...\n");
-
-  const capture = new Cap();
-  const buffer = Buffer.alloc(65535);
-  const linkType = capture.open(chosenDevice.name, filter, 10 * 1024 * 1024, buffer);
-  capture.setMinBytes?.(0);
-
-  capture.on("packet", () => {
-    try {
-      const offset = linkType === "ETHERNET" ? Ethernet(buffer).offset : 0;
-      const ipv4 = IPV4(buffer, offset);
-      const ip = ipv4.info.version === 4 ? ipv4 : IPV6(buffer, offset);
-      const transport =
-        ip.protocol === PROTOCOL.IP.TCP ? TCP(buffer, ip.offset) : UDP(buffer, ip.offset);
-
-      if (transport.data?.length) {
-        const direction = transport.info.srcport === port ? "Recv" : "Send";
-        printLine(direction, transport.data);
-      }
-    } catch {
-      // Ignorar paquetes truncados o no soportados
+  if (trimmed.toLowerCase().startsWith("pkt ")) {
+    const parts = trimmed.slice(4).trim().split(/\s+/);
+    const headerId = parseInt(parts[0], 10);
+    if (isNaN(headerId)) {
+      console.log("[!] Uso: pkt <HeaderID> [bytes hex]. Ejemplo: pkt 2191 00 00 00 ba");
+      return null;
     }
-  });
-
-  process.on("SIGINT", () => {
-    console.log("\n[*] Detenido.");
-    try {
-      capture.close();
-    } catch {}
-    process.exit(0);
-  });
-}
-
-// ---------- Motor 2: PowerShell + Npcap / Raw Socket ----------------------
-
-function buildSnifferScript(connection) {
-  const escapePs = (val) => String(val || "").replace(/'/g, "''");
-  const isUdp = connection.proto === "udp";
-
-  return `
-$ErrorActionPreference = 'SilentlyContinue'
-$LocalIP    = '${escapePs(connection.localIp)}'
-$LocalPort  = ${connection.localPort || 0}
-$RemoteIP   = '${escapePs(connection.remoteIp)}'
-$RemotePort = ${connection.remotePort}
-$ProtoNum   = ${isUdp ? 17 : 6}
-$IsUdp      = $${isUdp}
-
-if (-not $LocalIP) {
-  $probe = New-Object Net.Sockets.Socket([Net.Sockets.AddressFamily]::InterNetwork, [Net.Sockets.SocketType]::Dgram, [Net.Sockets.ProtocolType]::Udp)
-  $probe.Connect($RemoteIP, 9)
-  $LocalIP = $probe.LocalEndPoint.Address.ToString()
-  $probe.Close()
-}
-
-$localBytes  = [Net.IPAddress]::Parse($LocalIP).GetAddressBytes()
-$remoteBytes = [Net.IPAddress]::Parse($RemoteIP).GetAddressBytes()
-$buffer      = New-Object byte[] 65536
-
-function Test-IpMatch([byte[]]$buf, [int]$offset, [byte[]]$ip) {
-  return ($buf[$offset] -eq $ip[0] -and $buf[$offset+1] -eq $ip[1] -and $buf[$offset+2] -eq $ip[2] -and $buf[$offset+3] -eq $ip[3])
-}
-
-function Format-Packet([byte[]]$buf, [int]$length, [int]$baseOffset) {
-  if ($baseOffset -ge $length -or (($buf[$baseOffset] -band 0xF0) -ne 0x40) -or $buf[$baseOffset+9] -ne $ProtoNum) { return $null }
-
-  $ipHeaderLen = ($buf[$baseOffset] -band 0x0F) * 4
-  $transportOffset = $baseOffset + $ipHeaderLen
-  $srcPort = $buf[$transportOffset] * 256 + $buf[$transportOffset+1]
-  $dstPort = $buf[$transportOffset+2] * 256 + $buf[$transportOffset+3]
-
-  if ($IsUdp) {
-    $dataOffset = $transportOffset + 8
-  } else {
-    $tcpHeaderLen = (($buf[$transportOffset+12] -band 0xF0) -shr 4) * 4
-    $dataOffset = $transportOffset + $tcpHeaderLen
+    const hexBody = parts
+      .slice(1)
+      .join("")
+      .replace(/[^0-9a-fA-F]/g, "");
+    const bodyBuf = Buffer.from(hexBody, "hex");
+    const packet = Buffer.alloc(6 + bodyBuf.length);
+    packet.writeUInt32BE(2 + bodyBuf.length, 0);
+    packet.writeUInt16BE(headerId & 0xffff, 4);
+    bodyBuf.copy(packet, 6);
+    return packet;
   }
 
-  if ($dataOffset -ge $length) { return $null }
-
-  $isSend = (Test-IpMatch $buf ($baseOffset+12) $localBytes) -and (!$LocalPort -or $srcPort -eq $LocalPort) -and (Test-IpMatch $buf ($baseOffset+16) $remoteBytes) -and ($dstPort -eq $RemotePort)
-  $isRecv = (Test-IpMatch $buf ($baseOffset+12) $remoteBytes) -and ($srcPort -eq $RemotePort) -and (Test-IpMatch $buf ($baseOffset+16) $localBytes) -and (!$LocalPort -or $dstPort -eq $LocalPort)
-
-  if ($isSend) { $direction = 'Send' }
-  elseif ($isRecv) { $direction = 'Recv' }
-  else { return $null }
-
-  $payloadLen = $length - $dataOffset
-  $payload = New-Object byte[] $payloadLen
-  [Array]::Copy($buf, $dataOffset, $payload, 0, $payloadLen)
-
-  $time = Get-Date -Format 'HH:mm:ss'
-  $base64 = [Convert]::ToBase64String($payload)
-  return "[$time]\`t[$direction]\`t$base64"
-}
-
-# Intentar inicializar Npcap (wpcap.dll)
-$capHandle = [IntPtr]::Zero
-try {
-  Add-Type -TypeDefinition @'
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-
-[StructLayout(LayoutKind.Sequential)]
-public struct bpf_program_t { public uint bf_len; public IntPtr bf_insns; }
-
-public static class Npcap {
-  [DllImport("wpcap.dll", CharSet=CharSet.Ansi)] public static extern int pcap_findalldevs(ref IntPtr alldevs, StringBuilder errbuf);
-  [DllImport("wpcap.dll")] public static extern void pcap_freealldevs(IntPtr alldevs);
-  [DllImport("wpcap.dll", CharSet=CharSet.Ansi)] public static extern IntPtr pcap_open_live(string dev, int snaplen, int promisc, int to_ms, StringBuilder errbuf);
-  [DllImport("wpcap.dll")] public static extern int pcap_next_ex(IntPtr p, ref IntPtr hdr, ref IntPtr data);
-  [DllImport("wpcap.dll")] public static extern int pcap_datalink(IntPtr p);
-  [DllImport("wpcap.dll", CharSet=CharSet.Ansi)] public static extern int pcap_compile(IntPtr p, ref bpf_program_t fp, string str, int optimize, uint netmask);
-  [DllImport("wpcap.dll")] public static extern int pcap_setfilter(IntPtr p, ref bpf_program_t fp);
-}
-'@
-
-  Get-Service npcap, npf | Where-Object Status -ne 'Running' | Start-Service
-  $wmiConfig = Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' | Where-Object { $_.IPAddress -contains $LocalIP } | Select-Object -First 1
-  $adapterAlias = if ($wmiConfig) { (Get-WmiObject Win32_NetworkAdapter -Filter "Index=$($wmiConfig.Index)").NetConnectionID }
-
-  $devListPtr = [IntPtr]::Zero
-  $errBuf = New-Object Text.StringBuilder 256
-
-  if ([Npcap]::pcap_findalldevs([ref]$devListPtr, $errBuf) -eq 0 -and $devListPtr -ne [IntPtr]::Zero) {
-    $currentPtr = $devListPtr
-    $firstDev = $null
-    $selectedDev = $null
-
-    while ($currentPtr -ne [IntPtr]::Zero) {
-      $namePtr = [Runtime.InteropServices.Marshal]::ReadIntPtr($currentPtr, 8)
-      $descPtr = [Runtime.InteropServices.Marshal]::ReadIntPtr($currentPtr, 16)
-      $name = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($namePtr)
-      $desc = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($descPtr)
-
-      if (-not $name) { break }
-      if (-not $firstDev) { $firstDev = $name }
-
-      $isLoopback = $LocalIP.StartsWith('127.') -and ($desc -match 'loopback')
-      $isMatchingAdapter = $adapterAlias -and ($desc -match [regex]::Escape($adapterAlias))
-
-      if ($isLoopback -or $isMatchingAdapter) {
-        $selectedDev = $name
-        break
-      }
-      $currentPtr = [Runtime.InteropServices.Marshal]::ReadIntPtr($currentPtr, 0)
-    }
-
-    [Npcap]::pcap_freealldevs($devListPtr)
-    if (-not $selectedDev) { $selectedDev = $firstDev }
-
-    if ($selectedDev) {
-      $capHandle = [Npcap]::pcap_open_live($selectedDev, 65535, 1, 500, $errBuf)
-      if ($capHandle -ne [IntPtr]::Zero) {
-        $filterProg = New-Object bpf_program_t
-        $protoName = if ($IsUdp) { 'udp' } else { 'tcp' }
-        $filterStr = "$protoName and host $RemoteIP and port $RemotePort"
-
-        if ([Npcap]::pcap_compile($capHandle, [ref]$filterProg, $filterStr, 1, 0xffffffff) -ge 0) {
-          $null = [Npcap]::pcap_setfilter($capHandle, [ref]$filterProg)
-        }
-        $dataLink = [Npcap]::pcap_datalink($capHandle)
-        Write-Output "[INFO] Capturando con Npcap ($selectedDev)..."
-      }
-    }
+  let hexRaw = trimmed;
+  if (hexRaw.toLowerCase().startsWith("hex ")) {
+    hexRaw = hexRaw.slice(4);
   }
-} catch {}
+  const cleanHex = hexRaw.replace(/[^0-9a-fA-F]/g, "");
 
-# Fallback a Raw Socket si Npcap no pudo iniciarse
-if ($capHandle -eq [IntPtr]::Zero) {
-  try {
-    $rawSocket = New-Object Net.Sockets.Socket([Net.Sockets.AddressFamily]::InterNetwork, [Net.Sockets.SocketType]::Raw, [Net.Sockets.ProtocolType]::IP)
-    $rawSocket.Bind((New-Object Net.IPEndPoint([Net.IPAddress]::Parse($LocalIP), 0)))
-    $null = $rawSocket.IOControl([Net.Sockets.IOControlCode]::ReceiveAll, [BitConverter]::GetBytes([int]1), $null)
-    $rawSocket.ReceiveTimeout = 1000
-    Write-Output '[INFO] Capturando con raw socket (solo paquetes Send)...'
-  } catch {
-    Write-Output '[ERR] No se pudo iniciar Npcap ni raw socket.'
-    exit 1
-  }
-}
-
-# Bucle principal de lectura
-$hdrPtr = [IntPtr]::Zero
-$dataPtr = [IntPtr]::Zero
-
-while ($true) {
-  if ($capHandle -ne [IntPtr]::Zero) {
-    if ([Npcap]::pcap_next_ex($capHandle, [ref]$hdrPtr, [ref]$dataPtr) -le 0) { continue }
-    $packetLen = [Runtime.InteropServices.Marshal]::ReadInt32($hdrPtr, 8)
-    if ($packetLen -le 0) { continue }
-
-    [Runtime.InteropServices.Marshal]::Copy($dataPtr, $buffer, 0, $packetLen)
-    $etherType = $buffer[12] * 256 + $buffer[13]
-    $baseOffset = if ($dataLink -eq 0) { 4 } elseif ($etherType -eq 0x8100) { 18 } else { 14 }
-  } else {
-    try { $packetLen = $rawSocket.Receive($buffer) } catch { $packetLen = 0 }
-    if ($packetLen -lt 20) { continue }
-    $baseOffset = 0
+  if (!cleanHex || cleanHex.length % 2 !== 0) {
+    console.log(
+      "[!] Formato inválido. Usa:\n" +
+        "    - Bytes en hex:  d3923bb37ed4c1175fd0\n" +
+        "    - Paquete Habbo: pkt 2191 000000ba\n" +
+        "    - Texto ASCII:   ascii /flatctrl 4/sit 0.55 1/",
+    );
+    return null;
   }
 
-  $formattedLine = Format-Packet $buffer $packetLen $baseOffset
-  if ($formattedLine) {
-    Write-Output $formattedLine
-    [Console]::Out.Flush()
-  }
-}
-`.trim();
+  return Buffer.from(cleanHex, "hex");
 }
 
 function runPowershellEngine(connection) {
   const script = buildSnifferScript(connection);
-  const encodedScript = Buffer.from(script, "utf16le").toString("base64");
+  const tempScriptPath = path.join(__dirname, "sniffer_temp.ps1");
+  fs.writeFileSync(tempScriptPath, script, "utf8");
+
   const { proto, localIp, localPort, remoteIp, remotePort } = connection;
 
-  console.log("[*] Motor: PowerShell embebido (Npcap / Raw Socket)");
+  console.log("[*] Motor: PowerShell embebido (Npcap + Inyector de paquetes)");
   console.log(
-    `[*] Filtro: ${proto} ${localIp || "?"}:${localPort || "?"} <-> ${remoteIp}:${remotePort}`,
+    `[*] Filtro: ${proto} ${localIp || "*"}:${localPort || "*"} <-> ${remoteIp}:${remotePort}`,
   );
-  console.log("[*] Capturando (Ctrl+C para salir)...\n");
+  console.log("[*] Comandos para enviar paquetes al servidor mientras capturas:");
+  console.log("    - Hex crudo:     d3923bb37ed4c1175fd0");
+  console.log("    - Paquete Habbo: pkt 2191 000000ba");
+  console.log("    - Texto ASCII:   ascii /flatctrl 4/sit 0.55 1/\n");
 
   const child = spawn(
     "powershell.exe",
-    ["-NoProfile", "-NoLogo", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encodedScript],
-    { stdio: ["ignore", "pipe", "inherit"] },
+    ["-NoProfile", "-NoLogo", "-ExecutionPolicy", "Bypass", "-File", tempScriptPath],
+    { stdio: ["pipe", "pipe", "inherit"] },
   );
 
-  const rl = readline.createInterface({ input: child.stdout });
+  const rlOut = readline.createInterface({ input: child.stdout });
 
-  rl.on("line", (line) => {
+  let autoInjected = false;
+
+  rlOut.on("line", (line) => {
     const match = line.match(/^\[(\d{2}:\d{2}:\d{2})\]\t\[(Send|Recv)\]\t([A-Za-z0-9+/=]+)$/);
     if (match) {
       const direction = match[2];
       const payload = Buffer.from(match[3], "base64");
       printLine(direction, payload);
+
+      if (!autoInjected) {
+        autoInjected = true;
+        setTimeout(() => {
+          console.log("\n[*] [AUTO] Disparando paquete/comando automático al servidor...");
+          const autoPayload = Buffer.from("/flatctrl 4/sit 0.55 1", "latin1");
+          const b64 = autoPayload.toString("base64");
+          child.stdin.write(`SEND:${b64}\n`);
+        }, 1000);
+      }
     } else if (line.trim()) {
       console.log(line);
     }
   });
 
-  child.on("exit", () => process.exit(0));
-  process.on("SIGINT", () => {
-    console.log("\n[*] Detenido.");
-    child.kill();
+  process.stdin.resume();
+  const rlIn = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: "",
+  });
+
+  rlIn.on("line", (input) => {
+    const packetBuf = parseUserPacketInput(input);
+    if (packetBuf && packetBuf.length > 0) {
+      const b64 = packetBuf.toString("base64");
+      child.stdin.write(`SEND:${b64}\n`);
+    }
+  });
+
+  const cleanup = () => {
+    try {
+      fs.unlinkSync(tempScriptPath);
+    } catch {}
+  };
+
+  child.on("exit", () => {
+    cleanup();
     process.exit(0);
   });
 
-  if (process.env.PACKETLOGGER_TIMEOUT) {
-    const timeoutMs = Number(process.env.PACKETLOGGER_TIMEOUT) * 1000;
-    setTimeout(() => {
-      console.log("\n[*] Tiempo agotado.");
-      child.kill();
-      process.exit(0);
-    }, timeoutMs);
-  }
+  process.on("SIGINT", () => {
+    console.log("\n[*] Detenido.");
+    cleanup();
+    child.kill();
+    process.exit(0);
+  });
 }
 
 // ---------- Formateo de salida y flujo principal --------------------------
@@ -522,13 +375,25 @@ function printLine(direction, payload) {
   const time = new Date().toTimeString().slice(0, 8);
   const hex = payload.toString("hex").replace(/(..)/g, "$1 ").trim();
 
-  // Si es un paquete estructurado con longitud (4 bytes) + Header ID (2 bytes)
+  if (payload.length >= 5 && payload.readInt32LE(0) === -1) {
+    const typeChar = String.fromCharCode(payload[4]);
+    const ascii = payload
+      .subarray(5)
+      .toString("latin1")
+      .replace(/[^\x20-\x7E]+/g, " · ")
+      .trim();
+    console.log(
+      `[${time}]\t[${direction}]\t[Source '${typeChar}' | Len: ${payload.length}] ${hex}` +
+        (ascii ? `\n\t\t\tTexto: "${ascii}"` : ""),
+    );
+    return;
+  }
+
   if (payload.length >= 6 && payload.readUInt32BE(0) === payload.length - 4) {
     const length = payload.readUInt32BE(0);
     const headerId = payload.readUInt16BE(4);
     const body = payload.subarray(6);
 
-    // Extraer cadenas ASCII legibles (precedidas por uint16 de longitud) o texto visible
     const asciiPreview = body
       .toString("latin1")
       .replace(/[^\x20-\x7E]+/g, " · ")
@@ -569,7 +434,7 @@ async function interactive() {
     `=== ${chosenProcess.name} (${chosenProcess.pid}) ===\n`,
     chosenProcess.connections,
     (c) =>
-      `${c.proto.toUpperCase()}  ${c.localIp}:${c.localPort}  <->  ${c.remoteIp}:${c.remotePort}`,
+      `${c.proto.toUpperCase()}  ${c.localIp || "*"}:${c.localPort}  <->  ${c.remoteIp}:${c.remotePort}`,
   );
 
   if (!chosenConnection) {
@@ -579,7 +444,6 @@ async function interactive() {
 
   try {
     process.stdin.setRawMode(false);
-    process.stdin.pause();
   } catch {}
 
   console.log(CLEAR);
@@ -610,4 +474,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { loadConnections, groupByProcess, rawMenu, menu, buildSnifferScript };
+module.exports = { loadConnections, groupByProcess, rawMenu, menu };
